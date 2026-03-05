@@ -269,88 +269,6 @@ __global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
 
 
 
-
-
-#define TILE_SIZE 32
-#define THREAD_ITEMS 4
-
-__global__ void gemm_register_22d(float* A, float* B, float* C, int M, int N, int K) {
-
-    __shared__ float A_shared[TILE_SIZE][TILE_SIZE+1];
-    __shared__ float B_shared[TILE_SIZE][TILE_SIZE];
-
-    // Each thread owns a 4x4 block of C
-    int rowBase = blockIdx.y * TILE_SIZE + threadIdx.y * THREAD_ITEMS;
-    int colBase = blockIdx.x * TILE_SIZE + threadIdx.x * THREAD_ITEMS;
-
-    // 16 accumulators in registers
-    float sum[THREAD_ITEMS][THREAD_ITEMS] = {{0.0f}};
-
-    int numOfTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
-
-    // Loading setup: 64 threads, 1024 elements per tile, 16 loads each
-    int linearIdx = threadIdx.y * blockDim.x + threadIdx.x;
-    int loadPerThread = (TILE_SIZE * TILE_SIZE) / (blockDim.x * blockDim.y);
-
-    for (int i = 0; i < numOfTiles; i++) {
-
-        // Collaborative load: each thread loads 16 elements of A and B
-        for (int l = 0; l < loadPerThread; i++) {
-            int idx = l * (blockDim.x * blockDim.y) + linearIdx;
-            int sRow = idx / TILE_SIZE;
-            int sCol = idx % TILE_SIZE;
-
-            int aRow = blockIdx.y * TILE_SIZE + sRow;
-            int aCol = i * TILE_SIZE + sCol;
-            if (aRow < M && aCol < K)
-                A_shared[sRow][sCol] = A[aRow * K + aCol];
-            else
-                A_shared[sRow][sCol] = 0.0f;
-
-            int bRow = i * TILE_SIZE + sRow;
-            int bCol = blockIdx.x * TILE_SIZE + sCol;
-            if (bRow < K && bCol < N)
-                B_shared[sRow][sCol] = B[bRow * N + bCol];
-            else
-                B_shared[sRow][sCol] = 0.0f;
-        }
-
-        __syncthreads();
-
-        // Compute: outer product of register fragments
-        for (int k = 0; k < TILE_SIZE; ++k) {
-            float a[THREAD_ITEMS];
-            float b[THREAD_ITEMS];
-
-            for (int ri = 0; ri < THREAD_ITEMS; ++ri)
-                a[ri] = A_shared[threadIdx.y * THREAD_ITEMS + ri][k];
-
-            for (int ci = 0; ci < THREAD_ITEMS; ++ci)
-                b[ci] = B_shared[k][threadIdx.x * THREAD_ITEMS + ci];
-
-            for (int ri = 0; ri < THREAD_ITEMS; ++ri)
-                for (int ci = 0; ci < THREAD_ITEMS; ++ci)
-                    sum[ri][ci] += a[ri] * b[ci];
-        }
-
-        __syncthreads();
-    }
-
-    // Write 4x4 results to C
-    for (int ri = 0; ri < THREAD_ITEMS; ++ri) {
-        for (int ci = 0; ci < THREAD_ITEMS; ++ci) {
-            int r = rowBase + ri;
-            int c = colBase + ci;
-            if (r < M && c < N)
-                C[r * N + c] = sum[ri][ci];
-        }
-    }
-}
-
-
-
-
-
 /*
     2D is geniunely troubling, requires additonal framework
 
@@ -388,17 +306,44 @@ __global__ void gemm_register_22d(float* A, float* B, float* C, int M, int N, in
 
 ----
 OH MY GOD EVERYTHING IS TECHNICALLY FLATTENED
-THE  TWO TREE FRAMEWORK IS FANTASTIC!!!
+THE TWO TREE FRAMEWORK IS FANTASTIC!!!
 
 */
 
+
+
+
+
+/**
+ *  GEMM 2D TILED REGISTER ACCUMULATED
+ *   78.06% faster than Naive
+ *   72.38% faster than Tiled
+ * 
+ * The following compares GEM 2D TILED REGISTER ACCUMULATED vs TILED
+ *  - Shared Memory Wavefronts -73.93% (50,331,648 -> 13,122,510):
+ *    > This shows our register accumulation significantly decreases the required number of shared memory transactions.
+ *      The register level is much faster than shared memory, which is one of the reasons why this kernel is much faster
+ *      than the prior kernels.
+ * 
+ *  - We see the folowing correlated statistics:
+ *    > Registers Per Thread +26.32% (38 -> 48)
+ *    > Achieved Occupancy -42.60% (66.60 -> 38.21)
+ *       - While this is my first occurance of a compute kernel, one can assume occupancy is not as strong as a metric of performance
+ *         compared to say a memory bound kernel which heavily relies on warp switching when waiting on memory.
+ *         These two statistics point towards the idea that we are trading increased register pressure for less occupancy,
+ *         but we are able to do 4x more work per thread, as well as faster work from our register accumulation. This overall
+ *         points to be a significant motivator in the kernels performance.
+ *         
+ *       - Note, we also see a -24.28% decrease in Executed Instructions. This is likely because since we are doing more work per thread,
+ *         we require less threads overall hence a decrease in Executed Instructions.
+ *   
+ */
 #define TILE_SIZE 32
 #define WORK_PER_THREAD 4
 __global__ void gemm_register_2d(float* A, float* B, float* C, int M, int N, int K) {
     
-    /*
-        Shell and Allocations
-    */
+/**************************** Intialize pointers & sum ***************************************************** */
+
     __shared__ float A_shared[32][33]; // [ELEMENT]
     __shared__ float B_shared[32][32]; // [ELEMENT]
 
@@ -407,49 +352,98 @@ __global__ void gemm_register_2d(float* A, float* B, float* C, int M, int N, int
 
     //Thread mapping
     //TODO: Redo the dimensional analysis on these parts
-    int col = blockIdx.x * blockDim.x + threadIdx.x * WORK_PER_THREAD; // Block * Thread + Thread = [Thread] 0-7
-    int row = blockIdx.y * blockDim.y + threadIdx.y * WORK_PER_THREAD; // Block * Thread + Thread = [Thread] 0-7
-    int flattenedId = threadIdx.y * blockDim.x + threadIdx.x; // Thread * Thread + Thread = [Thread] 0 - 63
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x * WORK_PER_THREAD; // [ELEMENT]
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y * WORK_PER_THREAD; // [ELEMENT]
     
-    int numOfTiles = K / TILE_SIZE; // 32 
+    int numOfTiles = (K + TILE_SIZE - 1) / TILE_SIZE; // 32 
     int numOfStrides = (TILE_SIZE * TILE_SIZE) / (blockDim.x * blockDim.y); // 16
+
+    //Flattened indexes for shared memory loading
+    int localId = threadIdx.y * blockDim.x + threadIdx.x;
+
 
     // SLIDING LOOP - We move along the K dimension
     for(int tileId = 0; tileId < numOfTiles; tileId++) {
 
-        //Task One: Load to Share Memory
+/****************************Load tile A and tile B into Shared Memory ******************************************************/
         
         // STAMPING LOOP - We cover 32x32 area
         for(int stride = 0; stride < numOfStrides; stride++) {
-            // 1. Flatten to flat thread count 0 - 63
+            // 1. Flatten to flat thread count 0 - 63 (completed by localId)
             // 2. Expand to Shared Memory flat thread count 0 - 1023
             // 3. Fold to Shared Memory Dimension (32x32)
             // 4. Matrix A & B to Shared Memory
-            
-            // 2. 
-            //Stored row wise hence formula is: Current Row * Size of Row + column 
-            int sharedMemoryId = stride * (blockDim.x * blockDim.y) + flattenedId; // Max value check: 15 * (8 * 8) + 63 = 1023, matches 0-1023 expected
+
+            //2. 
+            int flatIdx = stride * (blockDim.x * blockDim.y) + localId;
 
             //3.
-            int sRow = sharedMemoryId / 32; // [ELEMENT]
-            int sCol = sharedMemoryId % 32; // [ELEMENT]
+            int sRow = flatIdx >> 5; // [ELEMENT]
+            int sCol = flatIdx & 31; // [ELEMENT]
 
             // 4.
             // Matrix A
             //  Must be X Axis Access. Where * Size + WhereIn
-            int aCol = tileId * TILE_SIZE + sCol; // [BLOCK] * [ELEMENT/BLOCK] + [ELEMENT] = [ELEMENT], 0 - 1023
-            int aRow = blockIdx.y * TILE_SIZE + sRow; // [BLOCK] * [ELEMENT/BLOCK] + [ELEMENT] = [ELEMENT], 0 - 1023
+            int aRow = blockIdx.y * TILE_SIZE + sRow;
+            int aCol = tileId * TILE_SIZE + sCol;
+
             if(aCol < K && aRow < M) {
-
+                A_shared[sRow][sCol] = A[aRow * K + aCol];
             } else {
-
+                A_shared[sRow][sCol] = 0.0f;
             }
             
 
-
+            //Matrix B
+            // Must be Y Axis Access. Where * Size + WhereIn
+            int bRow = tileId * TILE_SIZE + sRow;
+            int bCol = blockIdx.x * TILE_SIZE + sCol;
+            if (bRow < K && bCol < N)
+                B_shared[sRow][sCol] = B[bRow * N + bCol];
+            else {
+                B_shared[sRow][sCol] = 0.0f;
+            }
         }
+
+        __syncthreads();
+
+/****************************Compute DOT product freely in Shared Memory ***************************************************** */
+        for(int k = 0; k < TILE_SIZE; k++) {
+            //Store the needed values to our registers from shared memory
+            float a[WORK_PER_THREAD];
+            float b[WORK_PER_THREAD];
+
+            //Gather values from A matrix. Matrix A is M * K. Where k is our sliding dimension
+            for(int regRow = 0; regRow < WORK_PER_THREAD; regRow++) {
+                a[regRow] = A_shared[threadIdx.y * WORK_PER_THREAD + regRow][k];
+            }
+
+            //Gather values from B matrix. Matrix B is K * N. Where k is our sliding dimension
+            for(int regCol = 0; regCol < WORK_PER_THREAD; regCol++) {
+                b[regCol] = B_shared[k][threadIdx.x * WORK_PER_THREAD + regCol];
+            }
+
+            //Calculate our matmul by taking our values from the register
+            for(int regRow = 0; regRow < WORK_PER_THREAD; regRow++) {
+                for(int regCol = 0; regCol < WORK_PER_THREAD; regCol++) {
+                    accumulate[regRow][regCol] += a[regRow] * b[regCol];
+                }
+            }
+        }
+        __syncthreads();
     }
 
+
+/**************************** Write sum to C ***************************************************** */
+    //Take our accumulated results, and put them into the C matrix
+    for (int regRow = 0; regRow < WORK_PER_THREAD; regRow++) {
+        for (int regCol = 0; regCol < WORK_PER_THREAD; regCol++) {
+            int r = row + regRow;
+            int c = col + regCol;
+            if (r < M && c < N)
+                C[r * N + c] = accumulate[regRow][regCol];
+        }
+    }
 }
 
 
@@ -492,10 +486,9 @@ __global__ void gemm_register_2d(float* A, float* B, float* C, int M, int N, int
     cudaMemcpy(dA, hA, sizeA, cudaMemcpyHostToDevice);
     cudaMemcpy(dB, hB, sizeB, cudaMemcpyHostToDevice);
 
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
-
-    dim3 block_reg(TILE_SIZE / THREAD_ITEMS, TILE_SIZE / THREAD_ITEMS);  // (8, 8) = 64 threads
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE); // (32, 32)
+    dim3 block_standard(TILE_SIZE, TILE_SIZE);                                   // (32, 32) = 1024 threads
+    dim3 block_reg(TILE_SIZE / WORK_PER_THREAD, TILE_SIZE / WORK_PER_THREAD);    // (8, 8) = 64 threads
 
     auto verify = [&](const char* name) {
         cudaDeviceSynchronize();
@@ -513,12 +506,14 @@ __global__ void gemm_register_2d(float* A, float* B, float* C, int M, int N, int
         cudaMemset(dC, 0, sizeC);
     };
 
-    gemm_naive<<<grid, block>>>(dA, dB, dC, M, N, K);
+    // Launch with standard 32x32 blocks
+    gemm_naive<<<grid, block_standard>>>(dA, dB, dC, M, N, K);
     verify("gemm_naive");
 
-    gemm_tiled<<<grid, block>>>(dA, dB, dC, M, N, K);
+    gemm_tiled<<<grid, block_standard>>>(dA, dB, dC, M, N, K);
     verify("gemm_tiled");
 
+    // Launch with the 8x8 register-tiled blocks
     gemm_register_2d<<<grid, block_reg>>>(dA, dB, dC, M, N, K);
     verify("gemm_register_2d");
 
@@ -529,4 +524,6 @@ __global__ void gemm_register_2d(float* A, float* B, float* C, int M, int N, int
     cudaFree(dA);
     cudaFree(dB);
     cudaFree(dC);
+    
+    return 0;
 }

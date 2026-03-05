@@ -155,6 +155,10 @@ Shared   |   TILE_SIZE     | [ELEMENTS/BLOCK]  | sCol   sRow | [ELEMENT] |
 Register | WORK_PER_THREAD | [ELEMENTS/THREAD] | rCol   rRow | [ELEMENT] |
 
 
+Two Step Verification:
+- We use dimensional analysis to ensure we have the correct units
+- We use Max Index Boundary Check to make sure the calculated value is within the range we expect
+
 - The Size and Size Unit allow us to bridge our Execution and Memory Table
 - When we:
    > Flatten from 2D to 1D, we can use the following formula  WhichRow * SizeOfRow + WhereInRow
