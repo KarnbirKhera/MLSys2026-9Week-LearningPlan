@@ -163,9 +163,34 @@ Two Step Verification:
 - When we:
    > Flatten from 2D to 1D, we can use the following formula  WhichRow * SizeOfRow + WhereInRow
    - We can use dimensional analysis to confirm whether our units are consistent.
-- 
 
 
+
+
+
+
+---------------------------------------------------------------------------------------------------------
+
+Can we understand our answers natural dimension, and how we can derive our tile size, register dimension before we code??
+
+Potential framework
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/d8abef46-a993-4afb-809d-167d546c3dea" />
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/61577395-7bec-49a9-b8a8-a8431a8db21c" />
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/f8c8de69-0406-493b-a1fb-dc2dec903601" />
+
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/43ed31dd-cb92-4b19-a2f8-8d58934130f3" />
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/95ee304f-4f88-42bd-afaf-d688b4f0834f" />
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/1b8de2ce-f5da-42aa-bd52-15e6aa706abe" />
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/8bcfec9d-d5fc-4c7a-b0a8-5df8745bca13" />
+
+<img width="2160" height="1620" alt="image" src="https://github.com/user-attachments/assets/cd748bca-2f0a-4e40-ac68-0c038ce34b14" />
 
 ------------------------------------------------------------
 
@@ -246,3 +271,6 @@ perspective of coding to tackle the problem, but rather forming our code the dim
 
 Rather to be more specific, if we can understand the natural dimensions of our problem, can the structure of our code/execution hierarchy come about in a way
 that can be systemically derived?
+
+
+
