@@ -164,3 +164,85 @@ Two Step Verification:
    > Flatten from 2D to 1D, we can use the following formula  WhichRow * SizeOfRow + WhereInRow
    - We can use dimensional analysis to confirm whether our units are consistent.
 - 
+
+
+
+------------------------------------------------------------
+
+------------------------------------------------------------
+
+SOFTMAX INSIGHT
+
+Online softmax is insightful. As I learn more and more techniques in the world of computer science,
+its seems the most impactful improvements are not ones that require significants amount of code, but rather
+they approach the problem from a different angle. Where rather coding the same thing with more lines/complexity to improve on edge cases
+for minor improvement, it can prove very worthy to step back from the code itself, and approach the problem as something to be solved
+at the fundamental level, rather than just by code.
+
+
+One thing I noticed from softmax is the formula to rescale an old running sum is
+
+oldSum * (oldSum-newSum) + newSumAddition
+
+I keep seeing this fundamental formula of 
+
+A * B + C
+
+I see it in neural networks where
+Weight * Input + Bias
+We use it to calculate how much our input is effected by the weight
+
+I see it where for the whole Two Tree framework, the whole idea was
+Coordinate * Stride + Offset
+To bridge our dimensional hierarchy from execution to memory
+
+
+This formula seems so fundamental and monumental, but so simple at the same time. My current understanding of it is essentially,
+no matter the subject whether that be neural networks, the Two Tree Framework or CUDA work it comes down to
+
+(Dimension A) * (Bridge from Dimension A to B) + Offset within B dimension
+
+
+But the thing is, this formula is recursive, we can bridge many dimensions at once! We can have the following:
+
+(Dimension A) * (Bridge from Dimension A to B) + (Dimension B) * (Bridge from Dimension B to C) + Offset within C dimension
+
+
+The question is, why is this equation so fundamental, why is bridging dimensions so a crucial necessity where every modern GPU
+optimizes the fused multiply add formula? I understand its used in neural networks and CUDA and everything inbetween, but the question is why
+this specific formula.
+
+I assume its because of its simplicity. I assume its because its the simplest way to express... something... maybe its the simplest bridge from
+Dimension A to Dimension B?
+#TODO ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Either way, in the shadow framework, we treat our Register, Shared and Global as different dimensions because say the following
+
+Register has a bit address of
+
+1234
+
+But Shared memory has a bit address of
+
+123456
+
+These additional two digits are a way to express more information, which we can see as a new dimension, especially when we see it as
+
+1234 + 56
+
+Where say 1234 are the same numbers, and 56 are the values that can change, its a way to express more information. To help me view it,
+I see it as the "shadow" casted from the register to the shared memory, where the shadow is the possible new values we can express within our new
+5 and 6 bits.
+
+Knowing this, we can use our A * B + C to bridge these dimensions, infact I assume that is how its used already. The thing is, we can extend this from
+
+Register > Shared > Global,
+
+but how does the execution tree come into this. Its our job to map our execution tree as well as we can to our memory tree.
+
+The question is, given a problem, if we can derive its natural dimension within the register shared or global, or just the natural dimension of the answer itself
+if we can match the same geometric structure the memory hierarchy creates with our execution hierarchy, does that mean we can pre-plan our CUDA code not from the
+perspective of coding to tackle the problem, but rather forming our code the dimensions of the problem?
+
+Rather to be more specific, if we can understand the natural dimensions of our problem, can the structure of our code/execution hierarchy come about in a way
+that can be systemically derived?
