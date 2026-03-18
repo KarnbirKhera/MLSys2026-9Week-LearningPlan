@@ -274,3 +274,19 @@ that can be systemically derived?
 
 
 
+------
+
+DEFERRED, SHOULD DO
+
+FP8 GEMV 
+
+PRACTICE FP8 INPUT TO FP32 ACCUMULATE, BACK TO FP8
+
+Essentially, we do computation in FP32 as it allows for more expression in our value
+
+
+------------
+
+SOFTMAX:
+
+Two Tree Framework does not capture tree reductions, or 1D vectors, need to update afterwords

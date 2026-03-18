@@ -337,6 +337,21 @@ __global__ void online_softmax(const float* input_matrix, float* output_matrix, 
 
 
 
+
+
+
+
+
+
+// NOTE THE CODE BELOW IS AI GENERATED
+
+
+
+
+
+
+
+
 /**************************** Helpers ***************************************************** */
 static void fill_rand(float* buffer, int num_elements, float range_lo, float range_hi) {
     for (int i = 0; i < num_elements; i++) {
@@ -426,6 +441,39 @@ int main() {
 
     naive_softmax<BLOCK_SIZE><<<NUM_ROWS, BLOCK_SIZE>>>(d_input, d_output, NUM_COLS);
     verify("naive_softmax");
+
+    // ── Test 3: stable softmax on normal input ────────────────────────────
+    printf("\n=== stable_softmax | normal input [-3, 3] ===\n");
+    fill_rand(h_input, TOTAL, -3.f, 3.f);
+    cpu_stable_softmax(h_input, h_ref, NUM_ROWS, NUM_COLS);
+    cudaMemcpy(d_input, h_input, TOTAL * sizeof(float), cudaMemcpyHostToDevice);
+    stable_softmax<BLOCK_SIZE><<<NUM_ROWS, BLOCK_SIZE>>>(d_input, d_output, NUM_COLS);
+    verify("stable_softmax");
+
+    // ── Test 4: stable softmax on large input — should NOT produce NaN ────
+    printf("\n=== stable_softmax | large input [990, 1010] ===\n");
+    fill_rand(h_input, TOTAL, 990.f, 1010.f);
+    cpu_stable_softmax(h_input, h_ref, NUM_ROWS, NUM_COLS);
+    cudaMemcpy(d_input, h_input, TOTAL * sizeof(float), cudaMemcpyHostToDevice);
+    stable_softmax<BLOCK_SIZE><<<NUM_ROWS, BLOCK_SIZE>>>(d_input, d_output, NUM_COLS);
+    verify("stable_softmax");
+
+    // ── Test 5: online softmax on normal input ────────────────────────────
+    printf("\n=== online_softmax | normal input [-3, 3] ===\n");
+    fill_rand(h_input, TOTAL, -3.f, 3.f);
+    cpu_stable_softmax(h_input, h_ref, NUM_ROWS, NUM_COLS);
+    cudaMemcpy(d_input, h_input, TOTAL * sizeof(float), cudaMemcpyHostToDevice);
+    online_softmax<BLOCK_SIZE><<<NUM_ROWS, BLOCK_SIZE>>>(d_input, d_output, NUM_COLS);
+    verify("online_softmax");
+
+    // ── Test 6: online softmax on large input — the real correctness gate ─
+    printf("\n=== online_softmax | large input [990, 1010] ===\n");
+    fill_rand(h_input, TOTAL, 990.f, 1010.f);
+    cpu_stable_softmax(h_input, h_ref, NUM_ROWS, NUM_COLS);
+    cudaMemcpy(d_input, h_input, TOTAL * sizeof(float), cudaMemcpyHostToDevice);
+    online_softmax<BLOCK_SIZE><<<NUM_ROWS, BLOCK_SIZE>>>(d_input, d_output, NUM_COLS);
+    verify("online_softmax");
+
 
     free(h_input); free(h_ref); free(h_output);
     cudaFree(d_input); cudaFree(d_output);
