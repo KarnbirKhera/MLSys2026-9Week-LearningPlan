@@ -304,6 +304,64 @@ Is two for loops mapping a two dimensional space of that curve? Maybe like the g
 
 To test, we need to apply this mindset to 4x4 registered allocated GEMM where does it make sense?
 
+
+--->
+
+If a for loop can be a riemann sum that covers a line,
+
+two loops covers an area
+
+and three loops covers an
+
+Area + Volume
+
+This volume may be confusing but we know it might be true because loook at the formula for say
+
+a square to a cube
+
+A square is B * W
+
+A cube is B * W * H
+
+Lets apply the same thinking to a circle to a cylinder
+
+the formula for a circle is pi * r^2
+
+but the formula for a cylinder is pi * r^2 * h
+
+but the funny thing is in CUDA
+
+To obtain a single point from our execution hierarchy to memory hierarchy, we have to do
+
+WhichBlockAmI * HowBigIsThisBlock + WhereInThis
+
+Which translates to
+
+Coordinate * Stride + Offset
+
+BUT THE TENSOR CORE FORMULA IS
+
+(COORDINATE * STRIDE + OFFSET ) * VOLUME?
+
+This might seem confusing so lets use the example you said for how 3D convolutions work
+
+we have 
+
+coordinate * stride + offset * time 
+
+and how that can relate to tensor cores is that this 3rd dimension is TIME
+
+Where
+
+say a 16x16 is we're processed 16 x16 data
+
+but 16x16x16 is were processed 16 TIMES of that 16x16 data AT ONCE
+
+If we see this geometircally,
+
+we go from not just the 2d plane, but its VOLUME/TIME
+
+
 ------------
 
 SOFTMAX:
