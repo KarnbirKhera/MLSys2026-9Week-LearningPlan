@@ -285,6 +285,25 @@ PRACTICE FP8 INPUT TO FP32 ACCUMULATE, BACK TO FP8
 Essentially, we do computation in FP32 as it allows for more expression in our value
 
 
+----
+
+Two Tree Frameework is too rigid for the flow dense attention, Load, Compute and Store does not capature it 
+
+FSMTTF
+
+----
+
+Is a for loop a riemann sums across a given curve or line??
+
+Our index is the x value, our given value is the y.
+
+Is every for loop essentially mapping a curve?
+
+Is two for loops mapping a two dimensional space of that curve? Maybe like the gradient descent visual we get a idea of our shape using two loops? Maybe it maps our problem space?
+
+
+To test, we need to apply this mindset to 4x4 registered allocated GEMM where does it make sense?
+
 ------------
 
 SOFTMAX:
