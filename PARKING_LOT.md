@@ -362,6 +362,8 @@ If we see this geometircally,
 we go from not just the 2d plane, but its VOLUME/TIME
 
 
+ARE TENSOR CORES ARE JUST ONE BIG PRAGMA UNROLL?
+
 ------------
 
 SOFTMAX:
