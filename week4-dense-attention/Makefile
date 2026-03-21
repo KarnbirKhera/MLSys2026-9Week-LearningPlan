@@ -3,8 +3,8 @@ FLAGS = -O2 -lineinfo
 
 all: attention
 
-attention: qkv_attention_standalone_1.cu
-	$(NVCC) $(FLAGS) -o attention qkv_attention_standalone_1.cu
+attention: attention_kernels.cu
+	$(NVCC) $(FLAGS) -o attention attention_kernels.cu
 
 run: attention
 	./attention
