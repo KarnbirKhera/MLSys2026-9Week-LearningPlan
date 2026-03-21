@@ -241,6 +241,10 @@ I assume its because of its simplicity. I assume its because its the simplest wa
 Dimension A to Dimension B?
 #TODO ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+
+
+
+
 Either way, in the shadow framework, we treat our Register, Shared and Global as different dimensions because say the following
 
 Register has a bit address of
@@ -290,3 +294,50 @@ Essentially, we do computation in FP32 as it allows for more expression in our v
 SOFTMAX:
 
 Two Tree Framework does not capture tree reductions, or 1D vectors, need to update afterwords
+
+Does not capture tensor cores as they work in a different dimension. But its like this most likely
+
+Linear Regression: Complex patterns are seen as non-linear lines
+Polynomial Regiressoin: The same complex pattern when viewed from a higher dimension is linear
+
+To extend the framework, we must view these complex patterns (Tensor cores) from a higher dimension.
+
+The challenge would be to bridge seamlessly between this low dimension (CUDA Core) and high dimension (Tensor Core)
+and I suspect we might be able to use A * B + C again.
+
+
+
+
+
+
+-------------------------
+Dense Attention:
+
+Multi-Headed Attention
+    We incorporate a new dimension Z within our block. I am new to this so this will be interesting none the less.
+    It seems each head does not require communication among one another.......
+
+    Tensor Core is essentially a unrolling the loop on the third dimension. Earlier in my parking lot I mentioned that the 
+    3rd dimension might not just be a spatial dimension like the first two, but rather a dimension of time. I say this because when I look at 3D convolutions,
+    The first two for loops give us the pixels x and y, but the third for loop gives us seperate frames, so a time dimension if you will.
+
+    I made a LinkedIn post about this and why I think this at the moment https://www.linkedin.com/feed/update/urn:li:activity:7440774158847913984/?originTrackingId=bfJ0MRzY8tLPNzV%2FDZiFgg%3D%3D
+
+    The thing is, if this is true, that means that this use of our 3rd dimension is essentially us just doing the same attention we did in the kernel before, but just the size of our Z dimension at once.
+
+    Again, if this is true, that means Tensor Cores were quite literally made for this, or rather, multi headed attention was quite literally made for Tensor Cores!!
+ 
+
+   //This is similar to shared memory where our Flatten -> Stride -> Unflatten required us to use 
+    // the division to find our row, and modulus to find our column.
+    // Is this Z dimension similar to shared memory thats pooled?
+    // Because on the X and Y dimension, we use a simple A * B + C affline map, so why does this require us to use / and % to get our row/col?
+
+    //We use our 1D given address of blockIdx.z to derive a 2D coordinate. The use of / and % allows us to unflatten from 1D to 2D.
+    // This is a generalized pattern!!
+
+    // A * B + C to flatten a 2D index into a 1D address
+    // Using / and % expands a 1D address to a 2D index!
+    
+    // A * B + C means we go from the logical world to the hardware world!
+    // / and % means we go from the hardware world to our logical world!
