@@ -289,13 +289,11 @@ PRACTICE FP8 INPUT TO FP32 ACCUMULATE, BACK TO FP8
 Essentially, we do computation in FP32 as it allows for more expression in our value
 
 
-----
+------------
 
-Two Tree Frameework is too rigid for the flow dense attention, Load, Compute and Store does not capature it 
+Two Tree Frameework is too rigid for the flow dense attention, Load, Compute and Store does not capature it
 
 FSMTTF
-
-----
 
 Is a for loop a riemann sums across a given curve or line??
 
@@ -305,9 +303,7 @@ Is every for loop essentially mapping a curve?
 
 Is two for loops mapping a two dimensional space of that curve? Maybe like the gradient descent visual we get a idea of our shape using two loops? Maybe it maps our problem space?
 
-
 To test, we need to apply this mindset to 4x4 registered allocated GEMM where does it make sense?
-
 
 --->
 
@@ -349,9 +345,9 @@ BUT THE TENSOR CORE FORMULA IS
 
 This might seem confusing so lets use the example you said for how 3D convolutions work
 
-we have 
+we have
 
-coordinate * stride + offset * time 
+coordinate * stride + offset * time
 
 and how that can relate to tensor cores is that this 3rd dimension is TIME
 
@@ -365,15 +361,14 @@ If we see this geometircally,
 
 we go from not just the 2d plane, but its VOLUME/TIME
 
-
 ARE TENSOR CORES ARE JUST ONE BIG PRAGMA UNROLL?
 
-------------
+
+------------------------------------------------------
 
 SOFTMAX:
 
 Two Tree Framework does not capture tree reductions, or 1D vectors, need to update afterwords
-<<<<<<< HEAD
 
 Does not capture tensor cores as they work in a different dimension. But its like this most likely
 
@@ -408,6 +403,9 @@ Multi-Headed Attention
     Again, if this is true, that means Tensor Cores were quite literally made for this, or rather, multi headed attention was quite literally made for Tensor Cores!!
  
 
+
+
+
    //This is similar to shared memory where our Flatten -> Stride -> Unflatten required us to use 
     // the division to find our row, and modulus to find our column.
     // Is this Z dimension similar to shared memory thats pooled?
@@ -421,5 +419,12 @@ Multi-Headed Attention
     
     // A * B + C means we go from the logical world to the hardware world!
     // / and % means we go from the hardware world to our logical world!
-=======
->>>>>>> b057f42ff5371312a5ce3ac899d752fd621b1b40
+    
+    int batch_idx = blockIdx.z / num_heads;
+    int head_idx  = blockIdx.z % num_heads;
+
+
+    ---------------------
+
+    When dealing with non-communicative operations such as addition or substraction, we can elevate them to e^ . This means we can 
+    use it as a running sum like softmax does
