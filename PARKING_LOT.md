@@ -289,11 +289,91 @@ PRACTICE FP8 INPUT TO FP32 ACCUMULATE, BACK TO FP8
 Essentially, we do computation in FP32 as it allows for more expression in our value
 
 
+----
+
+Two Tree Frameework is too rigid for the flow dense attention, Load, Compute and Store does not capature it 
+
+FSMTTF
+
+----
+
+Is a for loop a riemann sums across a given curve or line??
+
+Our index is the x value, our given value is the y.
+
+Is every for loop essentially mapping a curve?
+
+Is two for loops mapping a two dimensional space of that curve? Maybe like the gradient descent visual we get a idea of our shape using two loops? Maybe it maps our problem space?
+
+
+To test, we need to apply this mindset to 4x4 registered allocated GEMM where does it make sense?
+
+
+--->
+
+If a for loop can be a riemann sum that covers a line,
+
+two loops covers an area
+
+and three loops covers an
+
+Area + Volume
+
+This volume may be confusing but we know it might be true because loook at the formula for say
+
+a square to a cube
+
+A square is B * W
+
+A cube is B * W * H
+
+Lets apply the same thinking to a circle to a cylinder
+
+the formula for a circle is pi * r^2
+
+but the formula for a cylinder is pi * r^2 * h
+
+but the funny thing is in CUDA
+
+To obtain a single point from our execution hierarchy to memory hierarchy, we have to do
+
+WhichBlockAmI * HowBigIsThisBlock + WhereInThis
+
+Which translates to
+
+Coordinate * Stride + Offset
+
+BUT THE TENSOR CORE FORMULA IS
+
+(COORDINATE * STRIDE + OFFSET ) * VOLUME?
+
+This might seem confusing so lets use the example you said for how 3D convolutions work
+
+we have 
+
+coordinate * stride + offset * time 
+
+and how that can relate to tensor cores is that this 3rd dimension is TIME
+
+Where
+
+say a 16x16 is we're processed 16 x16 data
+
+but 16x16x16 is were processed 16 TIMES of that 16x16 data AT ONCE
+
+If we see this geometircally,
+
+we go from not just the 2d plane, but its VOLUME/TIME
+
+
+ARE TENSOR CORES ARE JUST ONE BIG PRAGMA UNROLL?
+
 ------------
 
 SOFTMAX:
 
 Two Tree Framework does not capture tree reductions, or 1D vectors, need to update afterwords
+<<<<<<< HEAD
 
 Does not capture tensor cores as they work in a different dimension. But its like this most likely
 
@@ -341,3 +421,5 @@ Multi-Headed Attention
     
     // A * B + C means we go from the logical world to the hardware world!
     // / and % means we go from the hardware world to our logical world!
+=======
+>>>>>>> b057f42ff5371312a5ce3ac899d752fd621b1b40
