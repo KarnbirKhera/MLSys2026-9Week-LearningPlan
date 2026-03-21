@@ -1,0 +1,38 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /usr/local/cuda-12.6/bin/nvcc
+
+cflags = -DTORCH_EXTENSION_NAME=attention_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /home/korni/CUDAExperiments/Competiton_Directory/KarnbirKhera-MLSys2026-Deepseek-Sparse-Attention-TrackB/fi-bench/lib/python3.12/site-packages/torch/include -isystem /home/korni/CUDAExperiments/Competiton_Directory/KarnbirKhera-MLSys2026-Deepseek-Sparse-Attention-TrackB/fi-bench/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda-12.6/include -isystem /usr/include/python3.12 -fPIC -std=c++17
+post_cflags = 
+cuda_cflags = -DTORCH_EXTENSION_NAME=attention_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /home/korni/CUDAExperiments/Competiton_Directory/KarnbirKhera-MLSys2026-Deepseek-Sparse-Attention-TrackB/fi-bench/lib/python3.12/site-packages/torch/include -isystem /home/korni/CUDAExperiments/Competiton_Directory/KarnbirKhera-MLSys2026-Deepseek-Sparse-Attention-TrackB/fi-bench/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda-12.6/include -isystem /usr/include/python3.12 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O2 -lineinfo -DWITH_TORCH -std=c++17
+cuda_post_cflags = 
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = -shared -L/home/korni/CUDAExperiments/Competiton_Directory/KarnbirKhera-MLSys2026-Deepseek-Sparse-Attention-TrackB/fi-bench/lib/python3.12/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda-12.6/lib64 -lcudart
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build attention_kernels.cuda.o: cuda_compile /home/korni/CUDAExperiments/flashinfer-learning/week4-dense-attention/attention_kernels.cu
+
+
+
+
+
+build attention_cuda.so: link attention_kernels.cuda.o
+
+default attention_cuda.so

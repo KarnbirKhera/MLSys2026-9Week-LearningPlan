@@ -447,6 +447,31 @@ __global__ void attention_v3_online(
     For compute bound kernels, we may be able to trade register pressure for us to process our data from a 3rd dimension (Tensor Cores) since we trade higher occupancy/latency hiding for pure
     compute power.
 
+    ------------------------------------------------
+
+    The externel PyTorch test taught me that I had assumed both our passed Q K V matrices we're all square. 
+
+    This shows a gap in my kernel process where I should first write down my assumptions, so that they can be tackled through edge case handling.
+
+    Knowing this, I cannot assume that Q K and V will be proper square matrices, and my code should handle such cases
+
+    seq_q = Number of query tokens
+    seq_k = Number of keys
+    d_head = size of each token's vector within one attention head
+
+
+    DIMENSIONS OF OUR INPUT
+    Q -> (seq_q,d_head)
+    K -> (seq_k, d_head)
+    V -> (seq_k, d_head)
+    O -> (seq_q, d_head)
+
+
+    - Load our Q tile
+    - Load our K tile
+    - DOT product of Q * K (transposed), (seq_q * d_head) * (seq_k * d_head), our d_head gets reduced, meaning our DOT tells us how similar Q's and K's d_head was to each other, stored in S_tile
+    - We use our DOT product values stored in S_tile to determine our maxNum and runningSum
+    - We
 
 */
 
@@ -484,18 +509,19 @@ __global__ void attention_v4_multihead(
     int head_idx  = blockIdx.z % num_heads; // Our column within the Z dimension
 
     // (Size of sequence_q) * (Size of d_head) -> Size of each column in our 3rd dimension
-    int head_stride = seq_q * d_head;
+    int head_stride_q_o = seq_q * d_head; // Our Q and O match each other's dimensions
+    int head_stride_k_v = seq_k * d_head; // Our K and V match each other's dimensions
 
     // (Number of Heads) * (How big each Head is) -> Size of each row (made up of our columns) in our 3rd dimension
-    int batch_stride = num_heads * head_stride;
+    int batch_stride_q_o = num_heads * head_stride_q_o;
+    int batch_stride_k_v = num_heads * head_stride_k_v;
 
     //           Execution     * Size in Memory +      Execution       * Size in Memory + Execution * 1 = Uses our Coordinate * Stride recursive formula from our Two Tree Framework
-
     //    Current Batch Column * Size of Batch  + Current Head Column  *  Size of Head  +    Offset Q   = Our global current address in our Q matrix
-    const float* Q_head = batch_idx * batch_stride + head_idx * head_stride + Q;
-    const float* K_head = batch_idx * batch_stride + head_idx * head_stride + K; // = Our global current address in our K matrix
-    const float* V_head = batch_idx * batch_stride + head_idx * head_stride + V; // = Our global current address in our V matrix
-    float*       O_head = batch_idx * batch_stride + head_idx * head_stride + O; // = Our global current address in our O matrix
+    const float* Q_head = batch_idx * batch_stride_q_o + head_idx * head_stride_q_o + Q;
+    const float* K_head = batch_idx * batch_stride_k_v + head_idx * head_stride_k_v + K; // = Our global current address in our K matrix
+    const float* V_head = batch_idx * batch_stride_k_v + head_idx * head_stride_k_v + V; // = Our global current address in our V matrix
+    float*       O_head = batch_idx * batch_stride_q_o + head_idx * head_stride_q_o + O; // = Our global current address in our O matrix
 
 
     //     Our current row block * Size of our tile + Which row we are in the tile
@@ -606,8 +632,10 @@ __global__ void attention_v4_multihead(
 /**************************** LOAD our matrix V into shared memory ***************************************************** */        
     //---------------------------------------------------- Our A * B for softmax_numerator
         // We apply our A * B bridge from our old max to our new max, now we must add our current value C
+        // Note, this is technically not included in our LOAD of V tile, and could have been done at the same time as our runningTotal *= correction,
+        // but for clarity sakes, we can bring it down here as it groups our A * B + C operation for softmax_numerator
         softmax_numerator *= correction;
-
+    //------------------------------------------------------
         // We iterate over our v_row
         int v_row = tileId_LongSide * TILE_SIZE + threadIdx.y;
         // Our current column in our V tile
@@ -623,13 +651,21 @@ __global__ void attention_v4_multihead(
 
         __syncthreads();
 
+        //We iterate over our tile size
         for (int k = 0; k < TILE_SIZE; k++)
+            //We add our current values to our softmax_numerator, we are doing 
+            //                                our e^(S_tile unweighted DOT product - max)
+            //                                our V_tile[iterate down row][parallelize across row, column wise] 
+            // This gives us our updated + C to add to softmax_numerator  
             softmax_numerator += expf(S_tile[threadIdx.y][k] - max_number) * V_tile[k][threadIdx.x];
 
         __syncthreads();
     }
 
+/**************************** COMPUTE & STORE our Softmax value ***************************************************** */
+    //Bounds check
     if (row < seq_q && col < d_head)
+        //We output our 0-1 softmax value to our O matrix
         O_head[row * d_head + col] = softmax_numerator / runningTotal;
 }
 
@@ -646,259 +682,164 @@ __global__ void attention_v4_multihead(
 
 
 
+
+
+
+
+
+
+
 /* CODE BELOW IS AI GENERATED */
 
-// ==========================================================================
-// CPU reference: full multi-head attention
-// Layout: (batch, num_heads, seq, d_head) — same as the GPU kernel
-// For each (batch, head) pair independently:
-//   1. Q * K^T scaled
-//   2. Row-wise softmax
-//   3. Softmax weights * V
-// ==========================================================================
-void multihead_attention_cpu(
+
+/**************************** Helpers ***************************************************** */
+
+// CPU reference — matches the kernel's layout (batch, heads, seq, d_head).
+// K and V are (batch, heads, seq_k, d_head) so their stride uses seq_k, not seq_q.
+static void multihead_attention_cpu(
     const float* Q, const float* K, const float* V, float* O,
-    int batch_size, int num_heads, int seq_q, int seq_k, int d_head,
-    float constant_scale
+    int batch_size, int num_heads, int seq_q, int seq_k, int d_head, float scale
 ) {
-    int head_stride  = seq_q * d_head;
-    int batch_stride = num_heads * head_stride;
-
-    // Temporary buffer for the (seq_q, seq_k) score matrix — one head at a time
-    float* S = (float*)malloc(seq_q * seq_k * sizeof(float));
-
+    int hs_q=seq_q*d_head, bs_q=num_heads*hs_q;
+    int hs_kv=seq_k*d_head, bs_kv=num_heads*hs_kv;
+    float* S = (float*)malloc(seq_q*seq_k*sizeof(float));
     for (int b = 0; b < batch_size; b++) {
         for (int h = 0; h < num_heads; h++) {
-
-            // Navigate to this (batch, head) pair — same TTF formula as the GPU kernel
-            const float* Q_head = Q + b * batch_stride + h * head_stride;
-            const float* K_head = K + b * batch_stride + h * head_stride;
-            const float* V_head = V + b * batch_stride + h * head_stride;
-            float*       O_head = O + b * batch_stride + h * head_stride;
-
-            // Q * K^T scaled: S[i][j] = dot(Q[i], K[j]) * scale
-            for (int i = 0; i < seq_q; i++) {
+            const float* Qh = Q + b*bs_q  + h*hs_q;
+            const float* Kh = K + b*bs_kv + h*hs_kv;
+            const float* Vh = V + b*bs_kv + h*hs_kv;
+            float*       Oh = O + b*bs_q  + h*hs_q;
+            for (int i = 0; i < seq_q; i++)
                 for (int j = 0; j < seq_k; j++) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < d_head; k++)
-                        sum += Q_head[i * d_head + k] * K_head[j * d_head + k];
-                    S[i * seq_k + j] = sum * constant_scale;
+                    float s = 0.f;
+                    for (int k = 0; k < d_head; k++) s += Qh[i*d_head+k]*Kh[j*d_head+k];
+                    S[i*seq_k+j] = s*scale;
                 }
-            }
-
-            // Row-wise numerically stable softmax
             for (int i = 0; i < seq_q; i++) {
-                float max_val = -INFINITY;
-                for (int j = 0; j < seq_k; j++)
-                    if (S[i * seq_k + j] > max_val) max_val = S[i * seq_k + j];
-                float row_sum = 0.0f;
-                for (int j = 0; j < seq_k; j++) {
-                    S[i * seq_k + j] = expf(S[i * seq_k + j] - max_val);
-                    row_sum += S[i * seq_k + j];
-                }
-                for (int j = 0; j < seq_k; j++)
-                    S[i * seq_k + j] /= row_sum;
+                float mx=-INFINITY, sum=0.f;
+                for (int j = 0; j < seq_k; j++) if (S[i*seq_k+j]>mx) mx=S[i*seq_k+j];
+                for (int j = 0; j < seq_k; j++) { S[i*seq_k+j]=expf(S[i*seq_k+j]-mx); sum+=S[i*seq_k+j]; }
+                for (int j = 0; j < seq_k; j++) S[i*seq_k+j]/=sum;
             }
-
-            // Softmax weights * V: O[i][d] = sum_j S[i][j] * V[j][d]
-            for (int i = 0; i < seq_q; i++) {
+            for (int i = 0; i < seq_q; i++)
                 for (int d = 0; d < d_head; d++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < seq_k; j++)
-                        sum += S[i * seq_k + j] * V_head[j * d_head + d];
-                    O_head[i * d_head + d] = sum;
+                    float s = 0.f;
+                    for (int j = 0; j < seq_k; j++) s += S[i*seq_k+j]*Vh[j*d_head+d];
+                    Oh[i*d_head+d] = s;
                 }
-            }
         }
     }
-
     free(S);
 }
 
+static void fill_rand(float* buf, int n) {
+    for (int i = 0; i < n; i++) buf[i] = ((float)rand()/RAND_MAX) - 0.5f;
+}
 
-// ==========================================================================
-// Helper: fill a buffer with random floats in [-0.5, 0.5]
-// ==========================================================================
-void fill_rand(float* buf, int n) {
-    for (int i = 0; i < n; i++)
-        buf[i] = ((float)rand() / RAND_MAX) - 0.5f;
+static float max_abs_error(const float* a, const float* b, int n) {
+    float e = 0.f;
+    for (int i = 0; i < n; i++) e = fmaxf(e, fabsf(a[i]-b[i]));
+    return e;
+}
+
+// PASS < 1e-3 | FAIL (numerical inaccuracy) 1e-3..1e-2 | FAIL (square/non-square) > 1e-2
+static void run_test(const char* label, int batch_size, int num_heads,
+                     int seq_q, int seq_k, int d_head, int square) {
+    float scale   = 1.0f / sqrtf((float)d_head);
+    int total_q   = batch_size * num_heads * seq_q * d_head;
+    int total_kv  = batch_size * num_heads * seq_k * d_head;
+
+    float *h_Q=(float*)malloc(total_q *sizeof(float)), *h_K=(float*)malloc(total_kv*sizeof(float));
+    float *h_V=(float*)malloc(total_kv*sizeof(float)), *h_O=(float*)malloc(total_q *sizeof(float));
+    float *h_ref=(float*)malloc(total_q*sizeof(float));
+    fill_rand(h_Q,total_q); fill_rand(h_K,total_kv); fill_rand(h_V,total_kv);
+
+    float *d_Q,*d_K,*d_V,*d_O;
+    cudaMalloc(&d_Q,total_q *sizeof(float)); cudaMalloc(&d_K,total_kv*sizeof(float));
+    cudaMalloc(&d_V,total_kv*sizeof(float)); cudaMalloc(&d_O,total_q *sizeof(float));
+    cudaMemcpy(d_Q,h_Q,total_q *sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K,h_K,total_kv*sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V,h_V,total_kv*sizeof(float),cudaMemcpyHostToDevice);
+
+    dim3 threads(TILE_SIZE,TILE_SIZE);
+    dim3 blocks((d_head+TILE_SIZE-1)/TILE_SIZE,(seq_q+TILE_SIZE-1)/TILE_SIZE,batch_size*num_heads);
+
+    printf("\n=== %s | batch=%d heads=%d seq_q=%d seq_k=%d d_head=%d ===\n",
+           label, batch_size, num_heads, seq_q, seq_k, d_head);
+    printf("Grid: (%d,%d,%d)  Block: (%d,%d)\n",
+           blocks.x,blocks.y,blocks.z,threads.x,threads.y);
+
+    attention_v4_multihead<<<blocks,threads>>>(
+        d_Q,d_K,d_V,d_O, batch_size,num_heads,seq_q,seq_k,d_head,scale);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_O,d_O,total_q*sizeof(float),cudaMemcpyDeviceToHost);
+
+    multihead_attention_cpu(h_Q,h_K,h_V,h_ref,batch_size,num_heads,seq_q,seq_k,d_head,scale);
+    float e = max_abs_error(h_O,h_ref,total_q);
+
+    const char* verdict;
+    if      (e < 1e-3f) verdict = "PASS";
+    else if (e < 1e-2f) verdict = "FAIL (numerical inaccuracy)";
+    else                verdict = square ? "FAIL (square test)" : "FAIL (non-square test)";
+    printf("  >> %-30s  max_err=%.2e\n", verdict, e);
+    printf("  %s\n", (e < 1e-3f) ? "------------------------------------------------------------"
+                                   : "============================================================");
+
+    free(h_Q);free(h_K);free(h_V);free(h_O);free(h_ref);
+    cudaFree(d_Q);cudaFree(d_K);cudaFree(d_V);cudaFree(d_O);
 }
 
 
-// ==========================================================================
-// Helper: compute max absolute error between two float buffers
-// ==========================================================================
-float max_abs_error(const float* a, const float* b, int n) {
-    float err = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float e = fabsf(a[i] - b[i]);
-        if (e > err) err = e;
-    }
-    return err;
-}
-
-
-// ==========================================================================
-// Main: tests attention_v4_multihead across two configurations
-//
-// Test 1 — square, power-of-two dimensions, single batch
-//   The "clean" case where no boundary guards are exercised.
-//   Good for confirming the core logic is correct.
-//
-// Test 2 — non-square, non-power-of-two, multiple batches
-//   seq_q != seq_k, neither a multiple of TILE_SIZE, batch_size > 1.
-//   This exercises the out-of-bounds masking and the Z-dimension
-//   delinearization across multiple batch elements simultaneously.
-// ==========================================================================
+/**************************** Main ***************************************************** */
 int main() {
     srand(42);
 
-    // ------------------------------------------------------------------
-    // Test 1: single batch, square dimensions
-    // ------------------------------------------------------------------
-    {
-        int batch_size = 1;
-        int num_heads  = 4;
-        int seq_q      = 64;
-        int seq_k      = 64;
-        int d_head     = 32;   // full d = num_heads * d_head = 128
-        float scale    = 1.0f / sqrtf((float)d_head);
+    printf("\n==================== SQUARE TESTS (seq_q == seq_k) ====================\n");
+    run_test("Square 1", 1,4,  64, 64, 32, 1);
+    run_test("Square 2", 2,4,  48, 48, 32, 1);
+    run_test("Square 3", 3,8,  96, 96, 64, 1);
 
-        // Total elements: batch * heads * seq * d_head
-        int total_qkv = batch_size * num_heads * seq_q * d_head;
-        int total_o   = batch_size * num_heads * seq_q * d_head;
-
-        float* h_Q   = (float*)malloc(total_qkv * sizeof(float));
-        float* h_K   = (float*)malloc(total_qkv * sizeof(float));
-        float* h_V   = (float*)malloc(total_qkv * sizeof(float));
-        float* h_O   = (float*)malloc(total_o   * sizeof(float));
-        float* h_ref = (float*)malloc(total_o   * sizeof(float));
-
-        fill_rand(h_Q, total_qkv);
-        fill_rand(h_K, total_qkv);
-        fill_rand(h_V, total_qkv);
-
-        float *d_Q, *d_K, *d_V, *d_O;
-        cudaMalloc(&d_Q, total_qkv * sizeof(float));
-        cudaMalloc(&d_K, total_qkv * sizeof(float));
-        cudaMalloc(&d_V, total_qkv * sizeof(float));
-        cudaMalloc(&d_O, total_o   * sizeof(float));
-        cudaMemcpy(d_Q, h_Q, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_K, h_K, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_V, h_V, total_qkv * sizeof(float), cudaMemcpyHostToDevice);
-
-        // Grid: x tiles d_head, y tiles seq_q, z covers every (batch, head) pair
-        dim3 threads(TILE_SIZE, TILE_SIZE);
-        dim3 blocks(
-            (d_head + TILE_SIZE - 1) / TILE_SIZE,
-            (seq_q  + TILE_SIZE - 1) / TILE_SIZE,
-            batch_size * num_heads
-        );
-
-        printf("=== Test 1: batch=%d heads=%d seq_q=%d seq_k=%d d_head=%d ===\n",
-               batch_size, num_heads, seq_q, seq_k, d_head);
-        printf("Grid: (%d, %d, %d)  Block: (%d, %d)\n",
-               blocks.x, blocks.y, blocks.z, threads.x, threads.y);
-
-        attention_v4_multihead<<<blocks, threads>>>(
-            d_Q, d_K, d_V, d_O,
-            batch_size, num_heads, seq_q, seq_k, d_head, scale
-        );
-
-        cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("CUDA error: %s\n", cudaGetErrorString(err));
-            return 1;
-        }
-
-        cudaMemcpy(h_O, d_O, total_o * sizeof(float), cudaMemcpyDeviceToHost);
-        multihead_attention_cpu(h_Q, h_K, h_V, h_ref,
-                                batch_size, num_heads, seq_q, seq_k, d_head, scale);
-
-        float err_val = max_abs_error(h_O, h_ref, total_o);
-        printf("Max absolute error vs CPU reference: %e\n", err_val);
-        printf("Result: %s\n\n", err_val < 1e-3f ? "PASS ✓" : "FAIL ✗");
-
-        free(h_Q); free(h_K); free(h_V); free(h_O); free(h_ref);
-        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
-    }
-
-    // ------------------------------------------------------------------
-    // Test 2: multiple batches, non-square non-power-of-two dimensions
-    // This is the real stress test — it exercises:
-    //   - Z delinearization across 2 * 4 = 8 independent computations
-    //   - Out-of-bounds masking (seq_q=48 and seq_k=80 both non-multiples of 32)
-    //   - seq_q != seq_k path through the kernel
-    // ------------------------------------------------------------------
-    {
-        int batch_size = 2;
-        int num_heads  = 4;
-        int seq_q      = 48;   // not a multiple of TILE_SIZE (32)
-        int seq_k      = 80;   // not a multiple of TILE_SIZE, and seq_q != seq_k
-        int d_head     = 32;
-        float scale    = 1.0f / sqrtf((float)d_head);
-
-        // Note: K and V are (batch, heads, seq_k, d_head) while Q and O are (batch, heads, seq_q, d_head)
-        // For simplicity we allocate with seq_q for Q/O and seq_k for K/V
-        int total_q  = batch_size * num_heads * seq_q * d_head;
-        int total_kv = batch_size * num_heads * seq_k * d_head;
-
-        float* h_Q   = (float*)malloc(total_q  * sizeof(float));
-        float* h_K   = (float*)malloc(total_kv * sizeof(float));
-        float* h_V   = (float*)malloc(total_kv * sizeof(float));
-        float* h_O   = (float*)malloc(total_q  * sizeof(float));
-        float* h_ref = (float*)malloc(total_q  * sizeof(float));
-
-        fill_rand(h_Q, total_q);
-        fill_rand(h_K, total_kv);
-        fill_rand(h_V, total_kv);
-
-        float *d_Q, *d_K, *d_V, *d_O;
-        cudaMalloc(&d_Q, total_q  * sizeof(float));
-        cudaMalloc(&d_K, total_kv * sizeof(float));
-        cudaMalloc(&d_V, total_kv * sizeof(float));
-        cudaMalloc(&d_O, total_q  * sizeof(float));
-        cudaMemcpy(d_Q, h_Q, total_q  * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_K, h_K, total_kv * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_V, h_V, total_kv * sizeof(float), cudaMemcpyHostToDevice);
-
-        dim3 threads(TILE_SIZE, TILE_SIZE);
-        dim3 blocks(
-            (d_head + TILE_SIZE - 1) / TILE_SIZE,
-            (seq_q  + TILE_SIZE - 1) / TILE_SIZE,
-            batch_size * num_heads
-        );
-
-        printf("=== Test 2: batch=%d heads=%d seq_q=%d seq_k=%d d_head=%d ===\n",
-               batch_size, num_heads, seq_q, seq_k, d_head);
-        printf("Grid: (%d, %d, %d)  Block: (%d, %d)\n",
-               blocks.x, blocks.y, blocks.z, threads.x, threads.y);
-
-        attention_v4_multihead<<<blocks, threads>>>(
-            d_Q, d_K, d_V, d_O,
-            batch_size, num_heads, seq_q, seq_k, d_head, scale
-        );
-
-        cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("CUDA error: %s\n", cudaGetErrorString(err));
-            return 1;
-        }
-
-        cudaMemcpy(h_O, d_O, total_q * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // The CPU reference uses the same head_stride = seq_q * d_head for Q/O
-        // but seq_k * d_head for K/V — pass seq_k explicitly so it navigates correctly
-        multihead_attention_cpu(h_Q, h_K, h_V, h_ref,
-                                batch_size, num_heads, seq_q, seq_k, d_head, scale);
-
-        float err_val = max_abs_error(h_O, h_ref, total_q);
-        printf("Max absolute error vs CPU reference: %e\n", err_val);
-        printf("Result: %s\n\n", err_val < 1e-3f ? "PASS ✓" : "FAIL ✗");
-
-        free(h_Q); free(h_K); free(h_V); free(h_O); free(h_ref);
-        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
-    }
+    printf("\n==================== NON-SQUARE TESTS (seq_q != seq_k) ====================\n");
+    run_test("Non-square 1 (seq_k > seq_q)", 1,4,  64,128, 32, 0);  // existing
+    run_test("Non-square 2 (seq_k > seq_q)", 2,4,  48, 80, 32, 0);  // existing
+    run_test("Non-square 3 (seq_k > seq_q)", 3,8,  96,160, 64, 0);  // existing
+    run_test("Non-square 4 (seq_q > seq_k)", 1,4, 128, 64, 32, 0);  // Q longer than K/V
+    run_test("Non-square 5 (seq_q > seq_k)", 2,4,  80, 48, 32, 0);  // non-power-of-two, flipped
+    run_test("Non-square 6 (seq_q > seq_k)", 3,8, 160, 96, 64, 0);  // skewed, d_head 2 tiles, flipped
+    run_test("Non-square 7 (d_head unaligned)", 2,4, 48, 80, 48, 0); // d_head may not be 32 or 64
 
     return 0;
 }
+
+
+/**************************** PyTorch extension wrapper ***************************************************** */
+// Only compiled when building via build.py. test_attention.py calls attention_cuda.forward()
+// and compares against F.scaled_dot_product_attention.
+
+#ifdef WITH_TORCH
+#include <torch/extension.h>
+
+torch::Tensor attention_forward(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, float scale)
+{
+    int batch_size=Q.size(0), num_heads=Q.size(1), seq_q=Q.size(2), d_head=Q.size(3);
+    int seq_k=K.size(2);
+    torch::Tensor O = torch::empty_like(Q);
+
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((d_head+TILE_SIZE-1)/TILE_SIZE,
+                (seq_q +TILE_SIZE-1)/TILE_SIZE,
+                batch_size * num_heads);
+
+    attention_v4_multihead<<<blocks, threads>>>(
+        Q.data_ptr<float>(), K.data_ptr<float>(),
+        V.data_ptr<float>(), O.data_ptr<float>(),
+        batch_size, num_heads, seq_q, seq_k, d_head, scale
+    );
+    return O;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &attention_forward, "attention_v4_multihead CUDA");
+}
+#endif

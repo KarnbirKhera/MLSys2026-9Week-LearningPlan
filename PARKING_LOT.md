@@ -428,3 +428,19 @@ Multi-Headed Attention
 
     When dealing with non-communicative operations such as addition or substraction, we can elevate them to e^ . This means we can 
     use it as a running sum like softmax does
+
+    -----------------------
+
+
+
+   The externel PyTorch test taught me that I had assumed both our passed Q K V matrices we're all square. 
+
+    This shows a gap in my kernel process where I should first write down my assumptions, so that they can be tackled through edge case handling.
+
+    Knowing this, I cannot assume that Q K and V will be proper square matrices, and my code should handle such cases
+
+    DIMENSIONS OF OUR INPUT
+    Q -> (seq_q,d_head)
+    K -> (seq_k, d_head)
+    V -> (seq_k, d_head)
+    O -> (seq_q, d_head)
