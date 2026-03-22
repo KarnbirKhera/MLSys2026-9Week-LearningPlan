@@ -444,3 +444,24 @@ Multi-Headed Attention
     K -> (seq_k, d_head)
     V -> (seq_k, d_head)
     O -> (seq_q, d_head)
+
+
+
+
+    -----------------------
+
+    RoPE
+
+    Rope works by rotating our vectors by x angle. This allows our attention to compare the RELATIVE difference between our vectors.
+
+    This works better than fixed positioning where say position one gets added to vector one, position two gets added to vector 2 etc.
+
+    RoPE allows us to deconstruct our K matrice into two parts, the keys themselves, and the positions. This allows us to compress K (no positioning) and V into 
+    a single latent compresison to later be upscaled.
+
+    The interesting thread I keep seeing is when comparing two objects, its not the absolute position that matters, but rather the relative difference between them
+    I saw this in soft max where we were able to subtract all of our values by the max number because we were not measuring the absolute position, but rather its
+    relative position to other values.
+
+    This is interesting and I'm curious to see where this relative difference can be applied to past kernels where the assumption may have been made we require
+    the absolute position rather than just the relative.
