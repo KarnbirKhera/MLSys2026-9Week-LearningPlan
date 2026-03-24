@@ -15,11 +15,17 @@ run: paged-kv-mla
 pytorch: paged-kv-mla.cu
 	$(PYTHON) build_paged.py && $(PYTHON) test_paged_attention.py
 
+pytorch-mla: paged-kv-mla.cu
+	$(PYTHON) build_paged.py && $(PYTHON) test_mla_attention.py
+
 profile: paged-kv-mla
 	ncu --set full --import-source yes --force-overwrite -o paged_profile ./paged-kv-mla
 	ncu-ui paged_profile.ncu-rep &
 
 clean:
-	rm -f paged-kv-mla paged_profile.ncu-rep
+	rm -f paged-kv-mla paged_profile.ncu-rep mla_profile.ncu-rep
 
-.PHONY: all run pytorch profile clean
+.PHONY: all run pytorch pytorch-mla profile-paged profile-mla clean
+
+pytorch-all: paged-kv-mla.cu
+	$(PYTHON) build_paged.py && $(PYTHON) test_paged_attention.py && $(PYTHON) test_mla_attention.py

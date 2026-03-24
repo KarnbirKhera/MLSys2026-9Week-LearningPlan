@@ -340,13 +340,497 @@ __global__ void attention_paged_v1(
 
 
 
+/*
+ DeepSeek-V2 MLA Attention
+
+ After reading: 
+ - DeepSeek's V2 paper
+    > Specifically Section 2.1 (Multi-Head Latent Attention)
+    > Specifically Section 3.1.2 (Hyper-Parameters)
+ - FlashInfer Bench
+    > Specifically dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64
+
+I have the following mental model of Multi-Head Latent Attention for this competition
+
+- My understanding of the DeepSeek paper proposes the following structure:
+   > W^DKV contains our down projection of our KV (C^KV)
+   > C^KV contains our compressed K and V. Just the contents, not our rotational positional vectors.
+   > C^KV up projects to both K_nope (K contents) and V (V contents)
+   > K_nope (K contents) concatenated with K_pe (K RoPE) for our original K with contents/positions
+   > With our (Q_nope ; Q_pe) DOT (K_nope ; K_pe) * V, we have our Q K V attention
+
+- Our kernel for this competition does the following:
+    > Given:
+       - q_nope                                 q_nope -> BFLOAT16 -> Q CONTENTS
+          > num_tokens   (X) (var)
+          > num_qo_heads (Y) (16)
+          > head_dim_ckv (Z) (512)
+       - q_pe                                   q_pe   -> BFLOAT16 -> Q POSITION
+          > num_tokens   (X) (var)
+          > num_qo_heads (Y) (16)
+          > head_dim_kpe (Z) (64)
+       - ckv_cache                           ckv_cache -> BFLOAT16 -> K & V CONTENTS
+          > num_pages    (X) (var)
+          > page_size    (Y) (64)
+          > head_dim_ckv (Z) (512)
+       - kpe_cache                           kpe_cache -> BFLOAT16 -> K POSITION
+          > num_pages    (X) (var)
+          > page_size    (Y) (64)
+          > head_dim_kpe (Z) (64)
+       - sparse_indices                 sparse_indices ->  INT32   -> SPARSE MASK !! NOT YET INCLUDED !!
+          > num_tokens   (X) (var)
+          > topk         (Y) (2048)
+       - sm_scale                             sm_scale ->  FLOAT32 -> SCALAR CONSTANT
+          > scalar       (X) (var)
 
 
 
 
 
 
-// BELOW CODE IS AI GENERATED
+    In our memory hierarchy we organize by
+     - Biggest -> Medium -> Smallest
+         (X)        (Y)        (Z)
+     -  Token   -> Heads  -> Element
+
+    So that when we access it, our smallest unit (element) is contingous
+
+
+    In our execution hierarchy, we organize by
+     - Smallest -> Medium -> Biggest
+         (X)        (Y)        (Z)
+
+    Our smallest (threadIdx.x) is in lockstep and parallelized
+
+    
+    This means when we map our execution hierarchy to our memory hierarchy, we have the following mapping
+        Execution           Memory
+           (X)      ->       (Z)       -> X is parallelized, and Z is contingous/coalesced
+
+    This tells us to maximize our threadIdx.x parallelization, we should process our Z dimension, 
+    which has contingous access between elements (stored right next to each other on hardware)
+
+
+
+    DIMENSIONAL ANALYSIS TABLE:
+     - q_nope, q_pe: 
+        Token -> Head -> Element
+
+     - ckv_cache, kpe_cache
+        Pages -> Tokens -> Element
+
+We DOT product our q_nope and ckv_cache, we know this by their matching Z dimension (dimension to be reduced), and q_nope provides our Q contents, while ckv_cache provides our K contents
+    RESULT: This gives us our un-weighted/un-normalized similarity scores
+        - NOTE: ckv_cache not only provides us our K contents, but also our V contents during our weighted output accumulation
+We DOT product our q_pe and kpe_cache, we know this by their matching Z dimension (dimension to be reduced), q_pe provides our Q position, while kpe_cache provides our K position
+    RESULT: This gives us our Q and K positional similarity scores
+
+
+IMPORTANT:
+ The difference between the papers implementation, and our FlashInfer MLSys 2026 implementation is the following:
+   - The paper describes for us to calculate the DOT product of our Q * K, we must do the following:
+      > q * (W_UK * ckv_cache)
+   - But our kernel's DOT product of Q * K, we only need to do
+      > q * ckv_cache
+ The reason for this is our provided q_nope (the contents of our Q), already was multiplied by W_UK before the kernel. 
+ Essentially because multiplication is associative (grouping does not matter), we can get away with
+   - (q * W_UK) * ckv_cache
+
+
+------------------------
+ After completing the kernel, the most helpful thing was to draw our input tensors, and our output tensor, and then figuring out how to use our
+ input tensors to reach our output tensor while following the paper's procedure. This helped me understand When we do 3D tensor DOT product 3D tensor,
+ we get a 4D tensor, and our Z dimension (the common dimension between both tensors) gets reduced. 
+
+ When we dot product:
+ - ckv_cache with q_nope we get a 4D tensor of [num_pages, page_size, num_tokens, num_qo_heads] (CONTENT)
+ - kpe_cache with q_ope we get a 4D tensor of [num_pages, page_size, num_tokens, num_qo_heads]  (POSITION)
+
+ Since both of these DOT products give us the same tensor layout, we can add them to each other.
+
+ Looking at our output, we know we need a 3D tensor of [num_tokens, num_qo_heads, head_dim_ckv] this tells us we are not done (also by reading our paper we know we are not done and have one more step)
+ To turn 4D tensor into a 3D tensor, we can re-use our ckv_cache tensor where:
+ - Our 4D Tensor is [num_pages, page_size, num_tokens, num_qo_heads]
+ - Our 3D Tensor is [num_pages, page_size, head_dim_ckv]
+
+ When we DOT product these two tensors, their matching dimensions get reduced/summed over. These matching dimensions are
+
+ - [num_pages] and [page_size]
+
+ And all of our remaining dimensions are our output dimensions. This leaves us with a final 3D tensor of 
+
+ - [num_tokens, num_qo_heads, head_dim_ckv]
+
+ This tells us the DOT products and additions we are doing. Note, geometry tells us how the data is shaped, and what operations are needed to be done.
+ But they do not tell us the order of operations, nor do they tell us any variables to track or the control flow of our kernel such as Load, Compute, Store etc.
+
+*/
+
+
+
+
+
+
+
+__global__ void attention_mla_v1(
+    const float* __restrict__ q_nope,
+    const float* __restrict__ q_pe,
+    const float* __restrict__ ckv_cache,
+    const float* __restrict__ kpe_cache,
+    const int*   __restrict__ page_table,
+    float*       __restrict__ O,
+    float*       __restrict__ out_lse,
+    int num_tokens,
+    int num_qo_heads,
+    int num_kv_tokens,
+    int head_dim_ckv,
+    int head_dim_kpe,
+    int max_logical_pages,
+    float sm_scale
+) {
+/**************************** Initialize row pointers & Shared memory***************************************************** */
+    //Our shared memory tiles, we traverse Qpe_tile and Kpe_tile column wise, giving us an implicit transpose, hence we must pad our column by one to ensure no bank conflicts
+    __shared__ float Q_tile  [TILE_SIZE][TILE_SIZE];
+    __shared__ float K_tile  [TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float Qpe_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ float Kpe_tile[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float S_tile  [TILE_SIZE][TILE_SIZE];
+    __shared__ float V_tile  [TILE_SIZE][TILE_SIZE];
+
+    // Our current head (Z)
+    int head_idx = blockIdx.z;
+
+    // Our current thread row within our tile
+    //       (CURRENT BLOCK ROW) * (SIZE OF TILE) + (WHICH THREAD ROW WITHIN TILE)
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    //Our current thread column within our tile
+    //       (CURRENT BLOCK COLUMN) * (SIZE OF TILE) + (WHICH THREAD COLUMN WITHIN TILE)
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    // Stride to go from token to token, CONTENT TENSOR
+    //               (HOW MANY HEADS) * (HOW MANY ELEMENTS) = HOW MANY ELEMENTS ACROSS ALL HEADS IN A SINGULAR TOKEN
+    int token_stride_q = num_qo_heads * head_dim_ckv;
+
+    // Stride to go from token to token, POSTIONAL TENSOR
+    //                 (HOW MANY HEADS) * (HOW MANY ELEMENTS) = HOW MANY ELEMENTS ACROSS ALL HEADS IN A SINGULAR TOKEN
+    int token_stride_qpe = num_qo_heads * head_dim_kpe;
+
+    // Determine which element we are at within our current head, CONTENT TENSOR
+    //                     (WHICH HEAD, COLUMN) * (HOW MANY ELEMENTS IN HEAD) + (WHICH ELEMENT WITHIN HEAD)
+    const float* Q_nope_head = head_idx * head_dim_ckv + q_nope;
+
+    // Determine which element we are at within our current head, POSTIONAL TENSOR
+    //                     (WHICH HEAD, COLUMN) * (HOW MANY ELEMENTS IN HEAD) + (WHICH ELEMENT WITHIN HEAD)
+    const float* Q_pe_head = head_idx * head_dim_kpe + q_pe;
+
+    // Determine which element we are at within our current head, OUTPUT TENSOR
+    //           (WHICH HEAD, COLUMN) * (HOW MANY ELEMENTS IN HEAD) + (WHICH ELEMENT WITHIN HEAD)
+    float* O_head = head_idx * head_dim_ckv + O;
+
+    float max_val = -INFINITY;
+    float running_sum = 0.0f;
+    float output_acc = 0.0f;
+
+    // How many times does our TILE need to SLIDE across our num_kv_tokens dimension to process the entire row
+    int num_kv_tiles = (num_kv_tokens + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
+
+/**************************** LOAD our q_nope_head elements into Q_tile shared memory >> Q_NOPE, EXECUTION HIERARCHY, CONTENT TENSOR***************************************************** */
+        //Intialize our S_tile to later be added upon. 0.0f initialization to ensure proper addition later on
+        S_tile[threadIdx.y][threadIdx.x] = 0.0f;
+
+        // How many times does our TILE needs iterate to COVER our TILE's current position in the head_dim_ckv dimension in BOTH ckv_cache and q_nope tensors.
+        // This dimension will be reduced and summed over.
+        int num_ckv_tiles = (head_dim_ckv + TILE_SIZE - 1) / TILE_SIZE;
+
+        for (int d_tile = 0; d_tile < num_ckv_tiles; d_tile++) {
+
+            // Our current column location within our tile 
+            //       (CURRENT TILE LOCATION) * (TILE_SIZE) + (CURRENT THREAD COLUMN WITHIN TILE)
+            int q_col = d_tile * TILE_SIZE + threadIdx.x;
+
+            //Bounds check
+            if (row < num_tokens && q_col < head_dim_ckv)
+                // Add our current ELEMENT COLUMN within our current q_nope_head to Q_tile (not transposed)
+                //                                           (CURRENT ROW) * (ROW SIZE) + (CURRENT COLUMN WITHIN ROW)
+                Q_tile[threadIdx.y][threadIdx.x] = Q_nope_head[row * token_stride_q + q_col];
+            else
+                // Pad 0.0f if out of bounds for later easy calculations
+                Q_tile[threadIdx.y][threadIdx.x] = 0.0f;
+
+
+/**************************** LOAD our K elements from our paged KV cache into K_tile shared memory >> CKV_CACHE, MEMORY HIERARCHY, CONTENT TENSOR ***************************************************** */
+            // Our current thread (column-wise) in our head_dim_ckv dimension of our Q_NOPE, EXECUTION HIERARCHY, CONTENT TENSOR
+            int k_d_idx = d_tile * TILE_SIZE + threadIdx.x;
+            // Our current thread (row-wise) in our num_kv_tokens dimension of our Q_NOPE, EXECUTION HIERARCHY, CONTENT TENSOR
+            int k_seq_idx = kv_tile * TILE_SIZE + threadIdx.y;
+
+            //Bounds check 
+            if (k_seq_idx < num_kv_tokens && k_d_idx < head_dim_ckv) {
+                // Our bridge between our execution hierarchy tensor q_nope and our memory hierarchy tensor ckv_cache. Both are content tensors
+                
+                // CONVERT OUR 1D HARDWARE ADDRESS (K_SEQ_IDX) INTO A LOGICAL 2D INDEX
+                // Which row does our column thread from q_nope map onto our ckv_cache tensor
+                int logical_page = k_seq_idx / PAGE_SIZE;
+                //Which column does our row thread from q_nope map onto our ckv_cache tensor
+                int token_in_page = k_seq_idx % PAGE_SIZE;
+
+                // Return respective page indice given our page row index
+                int phys_page = page_table[logical_page];
+
+                // Stride to go page to page (X dimension of our ckv_tensor)
+                //                  (HOW MANY TOKENS PER PAGE) * (HOW MANY ELEMENTS PER TOKEN)
+                int page_stride_ckv = PAGE_SIZE * head_dim_ckv;
+
+                // Stride to go token to token (Y dimension of our ckv_tensor)
+                int token_stride_ckv = head_dim_ckv;
+
+                // Store our current element, implicitly transposed in shared memory for later DOT product
+                K_tile[threadIdx.x][threadIdx.y] = ckv_cache[
+                    phys_page     * page_stride_ckv +  // (CURRENT PAGE, X)  * (SIZE OF PAGE, Y) + 
+                    token_in_page * token_stride_ckv + // (CURRENT TOKEN, Y) * (SIZE OF TOKEN, Z) + 
+                    k_d_idx                            // (CURRENT ELEMENT, Z)
+                ];
+            } else {
+                //Pad for easy computation later
+                K_tile[threadIdx.x][threadIdx.y] = 0.0f;
+            }
+
+            __syncthreads();
+/**************************** COMPUTE similiarity between vectors in our ckv_cache tensor and our q_nope tensor, reducing head_dim_ckv dimension***************************************************** */
+            for (int k = 0; k < TILE_SIZE; k++)
+                S_tile[threadIdx.y][threadIdx.x] += Q_tile[threadIdx.y][k] * K_tile[k][threadIdx.x];
+
+            __syncthreads();
+        }
+
+/**************************** LOAD our q_pe head elements into Q_tile shared memory >> Q_PE, EXECUTION HIERARCHY, POSITIONAL TENSOR***************************************************** */
+        // How many times does our TILE need to slide across the head_dim_kpe dimension in BOTH of our kpe_cache and q_pe tensors
+        int num_kpe_tiles = (head_dim_kpe + TILE_SIZE - 1) / TILE_SIZE;
+
+        for (int d_tile = 0; d_tile < num_kpe_tiles; d_tile++) {
+
+            // Our current thread within the tile
+            //           (CURRENT TILE * (TILE SIZE) + (WHICH COLUMN IN TILE)
+            int qpe_col = d_tile * TILE_SIZE + threadIdx.x;
+
+            //Bounds check
+            if (row < num_tokens && qpe_col < head_dim_kpe)
+                //Store within our Qpe_tile
+                //                 Within our Q_pe_heads (Y dimension) [Which head (Y) * How many tokens per head (X) + Which token within our head(Z)]
+                Qpe_tile[threadIdx.y][threadIdx.x] = Q_pe_head[row * token_stride_qpe + qpe_col];
+            else
+                //Pad for later calculation
+                Qpe_tile[threadIdx.y][threadIdx.x] = 0.0f;
+
+            // Bridge our current thread column location in our Q_PE POSITIONAL TENSOR (EXECUTION HIERARCHY) to our KPE_CACHE POSITIONAL TENSOR (MEMORY HIERARCHY)
+            //             (CURRENT TILE) * (SIZE OF TILE) + (CURRENT COLUMN WITHIN TILE)
+            int kpe_d_idx = d_tile * TILE_SIZE + threadIdx.x;
+            // Bridge our current thread row location in our Q_PE POSITIONAL TENSOR (EXECUTION HIERARCHY) to our KPE_CACHE POSITIONAL TENSOR (MEMORY HIERARCHY)
+            //             (CURRENT TILE) * (SIZE OF TILE) + (CURRENT ROW WITHIN TILE)
+            int kpe_seq_idx = kv_tile * TILE_SIZE + threadIdx.y;
+
+            //Bounds check as we traverse both tensors
+            if (kpe_seq_idx < num_kv_tokens && kpe_d_idx < head_dim_kpe) {
+                //Convert our 1D hardware address to a 2D logical address
+                // Our current row within our kpe_cache positional tensor, memory hierarchy
+                int logical_page = kpe_seq_idx / PAGE_SIZE;
+                // Our current column within our kpe_cache positional tensor, memory hierarchy
+                int token_in_page = kpe_seq_idx % PAGE_SIZE;
+
+                // Our physical index of where our elements are stored within our paged memory hierachy
+                int phys_page = page_table[logical_page];
+
+                // Stride between the current page and the next
+                //   (HOW MANY TOKENS PER PAGE) * (HOW MANY ELEMENTS PER TOKEN)
+                int page_stride_kpe = PAGE_SIZE * head_dim_kpe;
+
+                // Stride between our current token and the next
+                //                      (HOW MANY ELEMENTS PER TOKEN)
+                int token_stride_kpe = head_dim_kpe;
+
+                // Store our current element within our Kpe_tile, stored transposed for later DOT product. Must pad Kpe_tile column by one.
+                Kpe_tile[threadIdx.x][threadIdx.y] = kpe_cache[
+                    phys_page     * page_stride_kpe +   // (CURRENT PAGE)  * (SIZE OF PAGE)
+                    token_in_page * token_stride_kpe +  // (CURRENT TOKEN) * (SIZE OF TOKEN)
+                    kpe_d_idx                           // (OUR CURRENT ELEMENT)
+                ];
+            } else {
+                //Pad for later easy computation
+                Kpe_tile[threadIdx.x][threadIdx.y] = 0.0f;
+            }
+
+            __syncthreads();
+
+/**************************** COMPUTE similiarity between vectors in our kpe_cache tensor and our q_pe tensor, reducing head_dim_kpe (elements) dimension***************************************************** */
+            for (int k = 0; k < TILE_SIZE; k++)
+                // Add to our positional similarity to S_tile values, which already has our scores for Q and K's CONTENT similarity, our output is a 4D Tensor stored by S_Tile
+                // our output is a 4D Tensor stored by S_Tile
+                //        Qpe_tile[current row, fixed][iterate over columns] * Kpe_tile[iterate down row][parallelize across column]
+                S_tile[threadIdx.y][threadIdx.x] += Qpe_tile[threadIdx.y][k] * Kpe_tile[k][threadIdx.x];
+
+            __syncthreads();
+        }
+
+/**************************** COMPUTE Apply a constant to S_tile to avoid numerical overflow***************************************************** */
+
+        // Apply a constant scale to all of our values within S_tile to avoid numerical overflow
+        S_tile[threadIdx.y][threadIdx.x] *= sm_scale;
+
+        // Our current column within our tile
+        //              (TILE LOCATION) * (TILE SIZE) + (CURRENT COLUMN WITHIN TILE)
+        int k_col_global = kv_tile * TILE_SIZE + threadIdx.x;
+
+        //Bounds check, ensure any column without a valid token does not effect our softmax
+        if (k_col_global >= num_kv_tokens)
+            S_tile[threadIdx.y][threadIdx.x] = -INFINITY;
+
+        __syncthreads();
+
+/**************************** COMPUTE Calculate/scale our softmax runningSum using the universal A * B + C brdige***************************************************** */
+        // Our current tile's maximum
+        float tile_max = -INFINITY;
+        
+        //Iterate across tile
+        for (int k = 0; k < TILE_SIZE; k++)
+            //Check if currentNum is above local tile_max
+            tile_max = fmaxf(tile_max, S_tile[threadIdx.y][k]);
+
+        // Compare tile_max to max_val across all tiles
+        float new_max = fmaxf(max_val, tile_max);
+        
+        //Calculate B in the bridge formula A * B + C. This allows us to scale old values to newer values when we come across a new max.
+        // A key insight that softmax uses to only materalize our matrices once.
+        float correction = expf(max_val - new_max);
+
+        // Apply our A * B bridge to our running_sum
+        running_sum *= correction;
+
+        //Iterate across our tile
+        for (int k = 0; k < TILE_SIZE; k++)
+            // Add our + C, the currentNumber scaled to the new maximum to finish our A * B + C bridge
+            running_sum += expf(S_tile[threadIdx.y][k] - new_max);
+
+        // Set our local tile max, to the max we've seen across all tiles thus far
+        max_val = new_max;
+
+/**************************** COMPUTE Calculate/scale our softmax numerator using A * B + C***************************************************** */
+        // Our A * B bridge, our + C term requires us to materalize our V_tile
+        output_acc *= correction;
+
+/**************************** LOAD our V_tile to later calculate our + C***************************************************** */
+        // Our current row within V tile, whom iterates across the ckv_cache, specifically the page_size(Y) dimension which contains how many tokens per page
+        //   (CURRENT TILE) * (TILE_SIZE) + (threadIdx.y)
+        int v_row = kv_tile * TILE_SIZE + threadIdx.y;
+        // Our current column within our blockIdx.x (execution hierarchy) 
+        int v_col = col;
+
+        //Bounds check 
+        if (v_row < num_kv_tokens && v_col < head_dim_ckv) {
+            //Map our 1D hardware address to a 2D logical index
+            // Our current row within our pages
+            int logical_page = v_row / PAGE_SIZE;
+            // Our current column within our page 
+            int token_in_page = v_row % PAGE_SIZE;
+
+            // Our page index of where we are 
+            int phys_page = page_table[logical_page];
+
+            // Stride between the current page and the next
+            //   (HOW MANY TOKENS PER PAGE) * (HOW MANY ELEMENTS PER TOKEN)
+            int page_stride_ckv = PAGE_SIZE * head_dim_ckv;
+
+            // Stride between our current token and the next
+            //               (HOW MANY ELEMENTS PER TOKEN)
+            int token_stride_ckv = head_dim_ckv;
+
+            // Store our current element within our V_tile
+            V_tile[threadIdx.y][threadIdx.x] = ckv_cache[
+                phys_page     * page_stride_ckv +   // (CURRENT PAGE) * (SIZE OF PAGE, giving us the unit [TOKENS])
+                token_in_page * token_stride_ckv +  // (CURRENT TOKEN) * (SIZE OF TOKEN, giving us the unit [ELEMENT])
+                v_col                               // (CURRENT ELEMENT)
+            ];
+        } else {
+            //Pad for later computation
+            V_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+/**************************** COMPUTE our + C term for our softmax numerator**************************************************** */
+        //Iterate over our tile
+        for (int k = 0; k < TILE_SIZE; k++)
+            // DOT product of our S_Tile (contains CONTENT and POSITION) by our V_tile (CONTAINS MEANING FOR OUR NUMBERS)
+            // We reduce/sum over our 4D S_tile tensor into a 3D tensor matching our output of num_tokens (X), num_qo_heads(Y) and head_dim_ckv(Z)
+            //             S_tile(currentNum - maxNum) * V_tile()             
+            //
+            //             S_tile([fixed row][iterate over columns]) * V_tile([iterate down rows][parallelize over columns])
+            output_acc += expf(S_tile[threadIdx.y][k] - max_val) * V_tile[k][threadIdx.x];
+
+        __syncthreads();
+    }
+
+/**************************** COMPUTE and STORE our weighted and normalized similarity value**************************************************** */
+    //Bounds check
+    if (row < num_tokens && col < head_dim_ckv)
+        // Store our weighted and normalized similarity value into our output tensor
+        //  (CURRENT ROW, Y) * (SIZE OF ROW, X) + (WHICH COLUMN IN ROW, X) = currentNum / runningSum
+        O_head[row * token_stride_q + col] = output_acc / running_sum;
+
+/**************************** STORE our runningSum for our next kernel launch **************************************************** */
+    //Bounds check, each of our respective tokens stores their runningSum (made up of heads)
+    if (row < num_tokens && col == 0) {
+        //Offset between 
+        //                     (CURRENT TOKEN) * (HEADS PER TOKEN) + (CURRENT HEAD WITHIN TOKEN)
+        long long lse_offset = (long long)row * num_qo_heads + head_idx;
+
+        //When we input a token, we want its respective heads value
+        out_lse[lse_offset] = logf(running_sum) + max_val;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// BELOW CODE IS AI GENERATED FOR TESTS
+
 
 
 /**************************** Helpers ***************************************************** */
@@ -494,6 +978,156 @@ static void run_test(const char* label,
     cudaFree(d_O); cudaFree(d_lse); cudaFree(d_pt);
 }
 
+/**************************** MLA Helpers ***************************************************** */
+
+static void build_paged_cache_mla(
+    const float* src, float* dst,
+    int num_kv_tokens, int feat_dim,
+    int pages_per_seq
+) {
+    for (int t = 0; t < num_kv_tokens; t++) {
+        int lp = t / PAGE_SIZE;
+        int tip = t % PAGE_SIZE;
+        for (int d = 0; d < feat_dim; d++) {
+            int from = t * feat_dim + d;
+            int to = lp * (PAGE_SIZE * feat_dim) + tip * feat_dim + d;
+            dst[to] = src[from];
+        }
+    }
+}
+
+static void attention_mla_cpu_ref(
+    const float* q_nope, const float* q_pe,
+    const float* ckv,    const float* kpe,
+    float* O,
+    int num_tokens, int num_heads,
+    int num_kv_tokens,
+    int head_dim_ckv, int head_dim_kpe,
+    float scale
+) {
+    float* S = (float*)malloc(num_tokens * num_kv_tokens * sizeof(float));
+    int stride_qn = num_heads * head_dim_ckv;
+    int stride_qp = num_heads * head_dim_kpe;
+
+    for (int h = 0; h < num_heads; h++) {
+        const float* Qn = q_nope + h * head_dim_ckv;
+        const float* Qp = q_pe + h * head_dim_kpe;
+        float* Oh = O + h * head_dim_ckv;
+
+        for (int i = 0; i < num_tokens; i++)
+        for (int j = 0; j < num_kv_tokens; j++) {
+            float s = 0.f;
+            for (int d = 0; d < head_dim_ckv; d++)
+                s += Qn[i * stride_qn + d] * ckv[j * head_dim_ckv + d];
+            for (int d = 0; d < head_dim_kpe; d++)
+                s += Qp[i * stride_qp + d] * kpe[j * head_dim_kpe + d];
+            S[i * num_kv_tokens + j] = s * scale;
+        }
+
+        for (int i = 0; i < num_tokens; i++) {
+            float mx = -INFINITY, sum = 0.f;
+            for (int j = 0; j < num_kv_tokens; j++) mx = fmaxf(mx, S[i * num_kv_tokens + j]);
+            for (int j = 0; j < num_kv_tokens; j++) { S[i * num_kv_tokens + j] = expf(S[i * num_kv_tokens + j] - mx); sum += S[i * num_kv_tokens + j]; }
+            for (int j = 0; j < num_kv_tokens; j++) S[i * num_kv_tokens + j] /= sum;
+        }
+
+        for (int i = 0; i < num_tokens; i++)
+        for (int d = 0; d < head_dim_ckv; d++) {
+            float s = 0.f;
+            for (int j = 0; j < num_kv_tokens; j++)
+                s += S[i * num_kv_tokens + j] * ckv[j * head_dim_ckv + d];
+            Oh[i * stride_qn + d] = s;
+        }
+    }
+    free(S);
+}
+
+static void run_test_mla(const char* label,
+                         int num_tokens, int num_heads,
+                         int num_kv_tokens,
+                         int head_dim_ckv, int head_dim_kpe) {
+    float scale = 1.0f / sqrtf((float)(head_dim_ckv + head_dim_kpe));
+    int pages_per_seq = (num_kv_tokens + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    int total_qn = num_tokens * num_heads * head_dim_ckv;
+    int total_qp = num_tokens * num_heads * head_dim_kpe;
+    int total_ckv = num_kv_tokens * head_dim_ckv;
+    int total_kpe = num_kv_tokens * head_dim_kpe;
+    int total_O = num_tokens * num_heads * head_dim_ckv;
+    int paged_ckv = pages_per_seq * PAGE_SIZE * head_dim_ckv;
+    int paged_kpe = pages_per_seq * PAGE_SIZE * head_dim_kpe;
+
+    float *h_qn = (float*)malloc(total_qn * sizeof(float));
+    float *h_qp = (float*)malloc(total_qp * sizeof(float));
+    float *h_ckv = (float*)malloc(total_ckv * sizeof(float));
+    float *h_kpe = (float*)malloc(total_kpe * sizeof(float));
+    float *h_ref = (float*)malloc(total_O * sizeof(float));
+    float *h_O = (float*)malloc(total_O * sizeof(float));
+    float *h_ckv_paged = (float*)calloc(paged_ckv, sizeof(float));
+    float *h_kpe_paged = (float*)calloc(paged_kpe, sizeof(float));
+    int *h_pt = (int*)malloc(pages_per_seq * sizeof(int));
+
+    fill_rand(h_qn, total_qn);
+    fill_rand(h_qp, total_qp);
+    fill_rand(h_ckv, total_ckv);
+    fill_rand(h_kpe, total_kpe);
+
+    build_paged_cache_mla(h_ckv, h_ckv_paged, num_kv_tokens, head_dim_ckv, pages_per_seq);
+    build_paged_cache_mla(h_kpe, h_kpe_paged, num_kv_tokens, head_dim_kpe, pages_per_seq);
+
+    for (int i = 0; i < pages_per_seq; i++) h_pt[i] = i;
+
+    attention_mla_cpu_ref(
+        h_qn, h_qp, h_ckv, h_kpe, h_ref,
+        num_tokens, num_heads, num_kv_tokens,
+        head_dim_ckv, head_dim_kpe, scale
+    );
+
+    float *d_qn, *d_qp, *d_ckv, *d_kpe, *d_O, *d_lse;
+    int *d_pt;
+
+    cudaMalloc(&d_qn, total_qn * sizeof(float));
+    cudaMalloc(&d_qp, total_qp * sizeof(float));
+    cudaMalloc(&d_ckv, paged_ckv * sizeof(float));
+    cudaMalloc(&d_kpe, paged_kpe * sizeof(float));
+    cudaMalloc(&d_O, total_O * sizeof(float));
+    cudaMalloc(&d_lse, num_heads * num_tokens * sizeof(float));
+    cudaMalloc(&d_pt, pages_per_seq * sizeof(int));
+
+    cudaMemcpy(d_qn, h_qn, total_qn * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_qp, h_qp, total_qp * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ckv, h_ckv_paged, paged_ckv * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kpe, h_kpe_paged, paged_kpe * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_pt, h_pt, pages_per_seq * sizeof(int), cudaMemcpyHostToDevice);
+
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((head_dim_ckv + TILE_SIZE - 1) / TILE_SIZE,
+                (num_tokens   + TILE_SIZE - 1) / TILE_SIZE,
+                num_heads);
+
+    attention_mla_v1<<<blocks, threads>>>(
+        d_qn, d_qp, d_ckv, d_kpe, d_pt,
+        d_O, d_lse,
+        num_tokens, num_heads, num_kv_tokens,
+        head_dim_ckv, head_dim_kpe,
+        pages_per_seq, scale
+    );
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_O, d_O, total_O * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float err = max_abs_error(h_O, h_ref, total_O);
+    const char* verdict = (err < 1e-3f) ? "PASS" : (err < 1e-2f) ? "FAIL (numerical)" : "FAIL";
+    printf("  %-50s  max_err=%.2e  %s\n", label, err, verdict);
+
+    free(h_qn); free(h_qp); free(h_ckv); free(h_kpe);
+    free(h_ref); free(h_O); free(h_ckv_paged); free(h_kpe_paged); free(h_pt);
+    cudaFree(d_qn); cudaFree(d_qp); cudaFree(d_ckv); cudaFree(d_kpe);
+    cudaFree(d_O); cudaFree(d_lse); cudaFree(d_pt);
+}
+
+
+
 /**************************** Main ***************************************************** */
 
 int main() {
@@ -510,6 +1144,20 @@ int main() {
     run_test("sk=2xPG b=1 h=4  sq=32  sk=128 d=32",  1, 4,  32, 128, 32);
     run_test("sk odd  b=1 h=4  sq=32  sk=80  d=32",  1, 4,  32,  80, 32);
 
+    printf("\n=== Week 5: MLA Paged Attention ===\n");
+    printf("All tests compare MLA kernel vs CPU reference with page_table[i]=i\n\n");
+
+    run_test_mla("square  tok=32  kv=64   h=4  ckv=32  kpe=16",  32,  4,  64,  32, 16);
+    run_test_mla("square  tok=48  kv=48   h=4  ckv=32  kpe=16",  48,  4,  48,  32, 16);
+    run_test_mla("kv>tok  tok=64  kv=128  h=4  ckv=32  kpe=16",  64,  4, 128,  32, 16);
+    run_test_mla("kv>tok  tok=96  kv=192  h=8  ckv=64  kpe=32",  96,  8, 192,  64, 32);
+    run_test_mla("tok>kv  tok=128 kv=64   h=4  ckv=32  kpe=16", 128,  4,  64,  32, 16);
+    run_test_mla("kv=PAGE tok=32  kv=64   h=4  ckv=32  kpe=16",  32,  4,  64,  32, 16);
+    run_test_mla("kv=2xPG tok=32  kv=128  h=4  ckv=32  kpe=16",  32,  4, 128,  32, 16);
+    run_test_mla("kv odd  tok=32  kv=80   h=4  ckv=32  kpe=16",  32,  4,  80,  32, 16);
+    run_test_mla("spec    tok=32  kv=64   h=16 ckv=512 kpe=64",  32, 16,  64, 512, 64);
+    run_test_mla("spec    tok=64  kv=128  h=16 ckv=512 kpe=64",  64, 16, 128, 512, 64);
+
     return 0;
 }
 
@@ -518,7 +1166,7 @@ int main() {
 #ifdef WITH_TORCH
 #include <torch/extension.h>
 
-torch::Tensor paged_attention_forward(
+std::vector<torch::Tensor> paged_attention_forward(
     torch::Tensor Q,
     torch::Tensor K_cache,
     torch::Tensor V_cache,
@@ -551,10 +1199,50 @@ torch::Tensor paged_attention_forward(
         batch_size, num_heads, seq_q, seq_k, d_head,
         max_logical_pages, scale
     );
-    return O;
+    return {O, lse};
+}
+
+std::vector<torch::Tensor> mla_attention_forward(
+    torch::Tensor q_nope,
+    torch::Tensor q_pe,
+    torch::Tensor ckv_cache,
+    torch::Tensor kpe_cache,
+    torch::Tensor page_table,
+    int num_kv_tokens,
+    float sm_scale
+) {
+    int num_tokens       = q_nope.size(0);
+    int num_qo_heads     = q_nope.size(1);
+    int head_dim_ckv     = q_nope.size(2);
+    int head_dim_kpe     = q_pe.size(2);
+    int max_logical_pages = page_table.size(0);
+
+    torch::Tensor O   = torch::empty_like(q_nope);
+    torch::Tensor lse = torch::empty({num_tokens, num_qo_heads},
+                                     torch::dtype(torch::kFloat32).device(q_nope.device()));
+
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((head_dim_ckv + TILE_SIZE - 1) / TILE_SIZE,
+                (num_tokens   + TILE_SIZE - 1) / TILE_SIZE,
+                num_qo_heads);
+
+    attention_mla_v1<<<blocks, threads>>>(
+        q_nope.data_ptr<float>(),
+        q_pe.data_ptr<float>(),
+        ckv_cache.data_ptr<float>(),
+        kpe_cache.data_ptr<float>(),
+        page_table.data_ptr<int>(),
+        O.data_ptr<float>(),
+        lse.data_ptr<float>(),
+        num_tokens, num_qo_heads, num_kv_tokens,
+        head_dim_ckv, head_dim_kpe,
+        max_logical_pages, sm_scale
+    );
+    return {O, lse};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &paged_attention_forward, "paged attention v1");
+    m.def("forward",     &paged_attention_forward, "paged attention v1");
+    m.def("forward_mla", &mla_attention_forward,   "MLA paged attention v1");
 }
 #endif

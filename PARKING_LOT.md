@@ -465,3 +465,31 @@ Multi-Headed Attention
 
     This is interesting and I'm curious to see where this relative difference can be applied to past kernels where the assumption may have been made we require
     the absolute position rather than just the relative.
+
+
+
+    ------------------------------------------
+
+    Paged KV Multi Latent Attention
+    
+    TTF needs a model for paged two phase addressing and tensors with two roles, for an example our ckv_cache has both compressed k and v
+
+
+
+    -----------------------------
+
+    If given an input tensor, and an output tensor
+
+
+    Each of the dimensions in the output tensor must be parallized, these are our output dimensions
+
+    If a dimension is in our input tensor, but not in our output tensor, that means it was reduced/summed up.
+    This reduction/summing is done by a for loop, rather than blockIdx.x, blockIdx.y or blockId.z
+
+
+    Every part of our execution hierarchy is PARALLELIZED just in different COARSES/FINENESS...
+
+    blockIdx = COARSER 
+    threadIdx = FINER
+
+    As we know threadIdx.x is in lockstep
