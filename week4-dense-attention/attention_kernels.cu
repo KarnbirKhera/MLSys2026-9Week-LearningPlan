@@ -471,7 +471,8 @@ __global__ void attention_v3_online(
     - Load our K tile
     - DOT product of Q * K (transposed), (seq_q * d_head) * (seq_k * d_head), our d_head gets reduced, meaning our DOT tells us how similar Q's and K's d_head was to each other, stored in S_tile
     - We use our DOT product values stored in S_tile to determine our maxNum and runningSum
-    - We
+    - We load our matrix V for our + C term to scale runningSum
+    - Compute and store weighted normalized softmax value
 
 */
 
@@ -694,8 +695,18 @@ __global__ void attention_v4_multihead(
 
 /**************************** Helpers ***************************************************** */
 
-// CPU reference — matches the kernel's layout (batch, heads, seq, d_head).
-// K and V are (batch, heads, seq_k, d_head) so their stride uses seq_k, not seq_q.
+// Helpers and CPU references
+static void fill_rand(float* buf, int n) {
+    for (int i = 0; i < n; i++) buf[i] = ((float)rand()/RAND_MAX) - 0.5f;
+}
+
+static float max_abs_error(const float* a, const float* b, int n) {
+    float e = 0.f;
+    for (int i = 0; i < n; i++) e = fmaxf(e, fabsf(a[i]-b[i]));
+    return e;
+}
+
+// CPU reference for multi‑head attention (used by run_test)
 static void multihead_attention_cpu(
     const float* Q, const float* K, const float* V, float* O,
     int batch_size, int num_heads, int seq_q, int seq_k, int d_head, float scale
@@ -732,17 +743,179 @@ static void multihead_attention_cpu(
     free(S);
 }
 
-static void fill_rand(float* buf, int n) {
-    for (int i = 0; i < n; i++) buf[i] = ((float)rand()/RAND_MAX) - 0.5f;
+// ----------------------------------------------------------------------
+// Test functions for each kernel
+static void test_qkt_tiled() {
+    const int seq_q = 64, seq_k = 64, d = 32;
+    int total_q = seq_q * d;
+    int total_k = seq_k * d;
+    float *h_Q = (float*)malloc(total_q * sizeof(float));
+    float *h_K = (float*)malloc(total_k * sizeof(float));
+    float *h_S = (float*)malloc(seq_q * seq_k * sizeof(float));
+    float *h_S_ref = (float*)malloc(seq_q * seq_k * sizeof(float));
+
+    fill_rand(h_Q, total_q);
+    fill_rand(h_K, total_k);
+
+    float *d_Q, *d_K, *d_S;
+    cudaMalloc(&d_Q, total_q * sizeof(float));
+    cudaMalloc(&d_K, total_k * sizeof(float));
+    cudaMalloc(&d_S, seq_q * seq_k * sizeof(float));
+    cudaMemcpy(d_Q, h_Q, total_q * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, total_k * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((seq_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE);
+    qkt_tiled<<<blocks, threads>>>(d_Q, d_K, d_S, seq_q, seq_k, d);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_S, d_S, seq_q * seq_k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // CPU reference: Q * K^T
+    for (int i = 0; i < seq_q; i++) {
+        for (int j = 0; j < seq_k; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < d; k++)
+                sum += h_Q[i * d + k] * h_K[j * d + k];
+            h_S_ref[i * seq_k + j] = sum;
+        }
+    }
+
+    float err = max_abs_error(h_S, h_S_ref, seq_q * seq_k);
+    printf("qkt_tiled: max_err = %.2e %s\n", err, err < 1e-5 ? "PASS" : "FAIL");
+
+    free(h_Q); free(h_K); free(h_S); free(h_S_ref);
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_S);
 }
 
-static float max_abs_error(const float* a, const float* b, int n) {
-    float e = 0.f;
-    for (int i = 0; i < n; i++) e = fmaxf(e, fabsf(a[i]-b[i]));
-    return e;
+static void test_scale_and_softmax() {
+    const int seq_q = 64, seq_k = 64, d = 32;
+    const float scale = 1.0f / sqrtf((float)d);
+    int total_q = seq_q * d;
+    int total_k = seq_k * d;
+    float *h_Q = (float*)malloc(total_q * sizeof(float));
+    float *h_K = (float*)malloc(total_k * sizeof(float));
+    fill_rand(h_Q, total_q);
+    fill_rand(h_K, total_k);
+
+    float *h_S = (float*)malloc(seq_q * seq_k * sizeof(float));
+    float *h_S_ref = (float*)malloc(seq_q * seq_k * sizeof(float));
+
+    // Compute S = Q * K^T on CPU
+    for (int i = 0; i < seq_q; i++) {
+        for (int j = 0; j < seq_k; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < d; k++)
+                sum += h_Q[i * d + k] * h_K[j * d + k];
+            h_S_ref[i * seq_k + j] = sum * scale;
+        }
+    }
+
+    // Copy to device
+    float *d_S;
+    cudaMalloc(&d_S, seq_q * seq_k * sizeof(float));
+    cudaMemcpy(d_S, h_S_ref, seq_q * seq_k * sizeof(float), cudaMemcpyHostToDevice);
+
+    const int BLOCK_SIZE = 256; // Must be >= seq_k (64)
+    dim3 threads(BLOCK_SIZE);
+    dim3 blocks(seq_q);
+    scale_and_softmax<BLOCK_SIZE><<<blocks, threads>>>(d_S, seq_q, seq_k, scale);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_S, d_S, seq_q * seq_k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // CPU reference: row-wise softmax
+    for (int i = 0; i < seq_q; i++) {
+        float max_val = -INFINITY;
+        for (int j = 0; j < seq_k; j++)
+            max_val = fmaxf(max_val, h_S_ref[i * seq_k + j]);
+        float sum = 0.0f;
+        for (int j = 0; j < seq_k; j++) {
+            h_S_ref[i * seq_k + j] = expf(h_S_ref[i * seq_k + j] - max_val);
+            sum += h_S_ref[i * seq_k + j];
+        }
+        for (int j = 0; j < seq_k; j++)
+            h_S_ref[i * seq_k + j] /= sum;
+    }
+
+    float err = max_abs_error(h_S, h_S_ref, seq_q * seq_k);
+    printf("scale_and_softmax: max_err = %.2e %s\n", err, err < 1e-5 ? "PASS" : "FAIL");
+
+    free(h_Q); free(h_K); free(h_S); free(h_S_ref);
+    cudaFree(d_S);
 }
 
-// PASS < 1e-3 | FAIL (numerical inaccuracy) 1e-3..1e-2 | FAIL (square/non-square) > 1e-2
+static void test_attention_v3() {
+    const int seq_q = 64, seq_k = 64, d = 32;
+    const float scale = 1.0f / sqrtf((float)d);
+    int total_q = seq_q * d;
+    int total_kv = seq_k * d;
+
+    float *h_Q = (float*)malloc(total_q * sizeof(float));
+    float *h_K = (float*)malloc(total_kv * sizeof(float));
+    float *h_V = (float*)malloc(total_kv * sizeof(float));
+    float *h_O = (float*)malloc(total_q * sizeof(float));
+    float *h_ref = (float*)malloc(total_q * sizeof(float));
+
+    fill_rand(h_Q, total_q);
+    fill_rand(h_K, total_kv);
+    fill_rand(h_V, total_kv);
+
+    // CPU reference: full attention (naive)
+    float *S = (float*)malloc(seq_q * seq_k * sizeof(float));
+    for (int i = 0; i < seq_q; i++) {
+        for (int j = 0; j < seq_k; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < d; k++)
+                sum += h_Q[i * d + k] * h_K[j * d + k];
+            S[i * seq_k + j] = sum * scale;
+        }
+    }
+    for (int i = 0; i < seq_q; i++) {
+        float max_val = -INFINITY;
+        for (int j = 0; j < seq_k; j++) max_val = fmaxf(max_val, S[i * seq_k + j]);
+        float sum = 0.0f;
+        for (int j = 0; j < seq_k; j++) {
+            S[i * seq_k + j] = expf(S[i * seq_k + j] - max_val);
+            sum += S[i * seq_k + j];
+        }
+        for (int j = 0; j < seq_k; j++) S[i * seq_k + j] /= sum;
+    }
+    for (int i = 0; i < seq_q; i++) {
+        for (int k = 0; k < d; k++) {
+            float val = 0.0f;
+            for (int j = 0; j < seq_k; j++)
+                val += S[i * seq_k + j] * h_V[j * d + k];
+            h_ref[i * d + k] = val;
+        }
+    }
+    free(S);
+
+    // Allocate device memory
+    float *d_Q, *d_K, *d_V, *d_O;
+    cudaMalloc(&d_Q, total_q * sizeof(float));
+    cudaMalloc(&d_K, total_kv * sizeof(float));
+    cudaMalloc(&d_V, total_kv * sizeof(float));
+    cudaMalloc(&d_O, total_q * sizeof(float));
+    cudaMemcpy(d_Q, h_Q, total_q * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, total_kv * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, total_kv * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((d + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE);
+    attention_v3_online<<<blocks, threads>>>(d_Q, d_K, d_V, d_O, seq_q, seq_k, d, scale);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_O, d_O, total_q * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float err = max_abs_error(h_O, h_ref, total_q);
+    printf("attention_v3_online: max_err = %.2e %s\n", err, err < 1e-5 ? "PASS" : "FAIL");
+
+    free(h_Q); free(h_K); free(h_V); free(h_O); free(h_ref);
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+}
+
+// The existing run_test function for multi‑head kernel
+// (PASS < 1e-3 | FAIL (numerical inaccuracy) 1e-3..1e-2 | FAIL (square/non-square) > 1e-2)
 static void run_test(const char* label, int batch_size, int num_heads,
                      int seq_q, int seq_k, int d_head, int square) {
     float scale   = 1.0f / sqrtf((float)d_head);
@@ -789,33 +962,37 @@ static void run_test(const char* label, int batch_size, int num_heads,
     cudaFree(d_Q);cudaFree(d_K);cudaFree(d_V);cudaFree(d_O);
 }
 
-
-/**************************** Main ***************************************************** */
+// ----------------------------------------------------------------------
+// Main: runs all four test suites
 int main() {
     srand(42);
+    printf("\n========== Testing qkt_tiled ==========\n");
+    test_qkt_tiled();
+    printf("\n========== Testing scale_and_softmax ==========\n");
+    test_scale_and_softmax();
+    printf("\n========== Testing attention_v3_online ==========\n");
+    test_attention_v3();
 
+    printf("\n========== Testing attention_v4_multihead ==========\n");
     printf("\n==================== SQUARE TESTS (seq_q == seq_k) ====================\n");
     run_test("Square 1", 1,4,  64, 64, 32, 1);
     run_test("Square 2", 2,4,  48, 48, 32, 1);
     run_test("Square 3", 3,8,  96, 96, 64, 1);
 
     printf("\n==================== NON-SQUARE TESTS (seq_q != seq_k) ====================\n");
-    run_test("Non-square 1 (seq_k > seq_q)", 1,4,  64,128, 32, 0);  // existing
-    run_test("Non-square 2 (seq_k > seq_q)", 2,4,  48, 80, 32, 0);  // existing
-    run_test("Non-square 3 (seq_k > seq_q)", 3,8,  96,160, 64, 0);  // existing
-    run_test("Non-square 4 (seq_q > seq_k)", 1,4, 128, 64, 32, 0);  // Q longer than K/V
-    run_test("Non-square 5 (seq_q > seq_k)", 2,4,  80, 48, 32, 0);  // non-power-of-two, flipped
-    run_test("Non-square 6 (seq_q > seq_k)", 3,8, 160, 96, 64, 0);  // skewed, d_head 2 tiles, flipped
-    run_test("Non-square 7 (d_head unaligned)", 2,4, 48, 80, 48, 0); // d_head may not be 32 or 64
+    run_test("Non-square 1 (seq_k > seq_q)", 1,4,  64,128, 32, 0);
+    run_test("Non-square 2 (seq_k > seq_q)", 2,4,  48, 80, 32, 0);
+    run_test("Non-square 3 (seq_k > seq_q)", 3,8,  96,160, 64, 0);
+    run_test("Non-square 4 (seq_q > seq_k)", 1,4, 128, 64, 32, 0);
+    run_test("Non-square 5 (seq_q > seq_k)", 2,4,  80, 48, 32, 0);
+    run_test("Non-square 6 (seq_q > seq_k)", 3,8, 160, 96, 64, 0);
+    run_test("Non-square 7 (d_head unaligned)", 2,4, 48, 80, 48, 0);
 
     return 0;
 }
 
-
-/**************************** PyTorch extension wrapper ***************************************************** */
-// Only compiled when building via build.py. test_attention.py calls attention_cuda.forward()
-// and compares against F.scaled_dot_product_attention.
-
+// ----------------------------------------------------------------------
+// PyTorch extension wrapper (only when building with WITH_TORCH)
 #ifdef WITH_TORCH
 #include <torch/extension.h>
 

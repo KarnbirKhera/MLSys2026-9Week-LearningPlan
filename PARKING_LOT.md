@@ -550,3 +550,279 @@ Multi-Headed Attention
     3 FOR LOOPS -> ALL THREE DIMENSOINS OF OUR TENSOR COVERED
 
     REMEMBR THAT THESE DIMENSIONS OVERLAP ONE ANOTHER
+
+    -------------------------------------------------------
+
+KV Cache Paging
+
+This follows similar concept I mentioned on LinkedIn 
+
+LinkedIn: https://www.linkedin.com/feed/update/urn:li:activity:7442586118803496960/
+
+(I may have mentioned in here as well) but the idea is as follows.
+
+For Multi-Headed attention the big difference was that we had the following input tensor structure (example)
+
+[seq_q, d_head, batch_size, num_head]
+
+From this structure we see that this is a 4D tensor. The problem with a 4D tensor is our GPU archiecture is made to at maximum
+hold a 3 dimensional structure to process. We see this in its design where our execution hierarchy is
+
+Grid
+Block
+Thread
+
+And our memory hierarchy is
+
+Global
+Shared
+Register
+
+One can assume this is the case because at a hardware level I assume we arrive at diminishing returns when it comes to price per compute, as well as the 
+physical space on the actual silicon board which prevents us from efficiently capturing a 4D tensor to process.
+
+Because of this, multi-headed attention has a very clever work around. Instead of having a basic 4D tensor of 
+
+[seq_q, d_head, batch_size, num_head]
+
+we can actually flatten batch_size and num_head into a single dimension. This makes sense in principle since technically everything at the hardware level
+is flat, and the concept of dimensions is a principle for us to understand how to percieve this hardware 1D world. This means after flattening batch_size and batch_head
+
+we get a 3D tensor of
+
+[seq_q,d_head,batch_size/num_head]
+
+The question becomes how do we traverse this flattened dimension to get the information we need? From our prior knowledge we know the following assumption has thus far
+been true.
+
+To go from a 2D logical address to a 1D hardware address we use the following bridge.
+
+Index * Stride + Offset
+
+where for every Index * Stride, we are esesentially flatening the dimension, and we traverse the next dimension offset.
+Now to go from a 1D hardware address (our 3rd dimensionn is essentially a flattened hardware address), we can use the following assumption:
+
+Index / Stride
+Index % Stride
+
+Where index is our current location, and stride is how big each of our stored value is.
+
+The divison gives us the row within this 1D hardware dimension
+The modulus gives us the column within this 1D hardware dimension
+
+This essentially allows us to treat our single flattened dimension as a two dimensional space, while maintaing the 3D tensor hardware constraint.
+
+
+
+Now this comes with some downsides, which I will infer so if I was a reader I'd take caution in assuming if the following is actual based on hard truth.
+
+We have to store our row and columnn values, this means a very slight increase in register pressure.
+
+We can assume because we have two dimensions worth of data in a single dimension, compared to other dimensions that only hold
+1 "meaning" if you will, one can imagine we may hit the "ceiling" limit on the number of bits we can actively store within our shared memory or register.
+Although, this exact notation is countered by the fundamental idea of tiling, which says no matter how big our data is, if we process it piece by piece,
+we can process the entire dataset.
+
+
+At the moment, those are the cons I can think of. Now for the positives.
+
+This allows us to store more information within dimension.
+
+This also allows us to store information non-contingously. Where before for the formula of Index * Stride + Offset,
+one could assume we need a uniform understaniding of everything before this Index * Stride has relevant and valid data. But if we use paging
+We are directly accessing said stored data, without the assumption that everything before or after this is valid data. I believe this is the main point of paging
+where for LLMs say we have 10 tokens to process, we dont want to allocate 2048 tokens worth of space, paging allows to allocate just the amount needed since our 
+data doesnt ncessarily have to be stored next to each other. Although I'd admit at the moment the actual concept is rather unclear to me, so it definently needs some more
+learning and refining.
+
+
+Now for the inferred postivites, or the fun hypotheticals. 
+
+If our limit is a 3D tensor, and within that 3D tensor we can flatten dimensions.
+Can we theoretically flatten many dimensions within this 3D tensor, and if we can what is the diminishing return point, and at what point is
+it considered valuable
+
+-> Upon further thought, this means signficantly more register pressure, if our kernel is primarily compute bound, we can trade more register pressure for
+occupancy. Although yes we can transfer more information per tensor, but that really isn't the limiting factor since our DRAM can hold a signficant amount of data.
+
+-> Also, at I first I had thought that since we recieve more information per tensor, that meant we can do more calculations per input, but being able to express more
+information per tensor still means the data has to travel from the DRAM to our actual kernel, so there really isn't  a significant point
+
+
+Another fun theory is what if in our 3D tensor we have our first dimension soley as a paged index dimension. Where if we can to access say 
+our third dimension at a specific spot, our 1st dimension can tell us where to find said information as it provides the page and column indice in the 3rd dimension.
+
+This would allow us to more effectively use our memory. I say this because if KV caching is more efficient when it comes to memory allocation because of paging since it
+no longer requires contingous memory storage, one could assume the same beneift remains if we were to page all three tensor dimensions given to us.
+
+ -> This is rather interesting, and the pros are we not longer need to store data contingiously... hmm the problem might be though when we access said information, if it isnt
+ stored next to each other on the registers, that means we lose parallezation benefit of our threadIdx.x which is the pinacle of GPU programming. None the less, it is a very interesting
+ thought.
+
+
+ 
+
+ TOPK INDEXER
+
+
+     ///What does each thread contribute to in our paged diemnsion grid strided!!
+    // This is essentially pre-mapping our thread to our paged dimension
+    //Its like a piano where the keys are the threads, and they map to outer dimensions.
+    // It doenst cost to traverse this outer dimension because the keys themselves are tied to them
+    for (int i = threadIdx.x; i < NUM_HEADS * HEAD_DIM; i += blockDim.x) {
+        int h = i / HEAD_DIM;
+        int d = i % HEAD_DIM;
+        smem_q[h * SMEM_STRIDE + d] = q_base[i];
+    }
+
+
+THIS IS QUITE LITERALLY WHAT WE THEORIZED EARLIER WITH KV CACHE, AND IT ACTUALLY TURNS OUT TO BE USED IN TOPK INDEXING?????????????!!!!!
+
+"
+This would allow us to more effectively use our memory. I say this because if KV caching is more efficient when it comes to memory allocation because of paging since it
+no longer requires contingous memory storage, one could assume the same beneift remains if we were to page all three tensor dimensions given to us.
+
+ -> This is rather interesting, and the pros are we not longer need to store data contingiously... hmm the problem might be though when we access said information, if it isnt
+ stored next to each other on the registers, that means we lose parallezation benefit of our threadIdx.x which is the pinacle of GPU programming. None the less, it is a very interesting
+ thought.
+"
+
+
+
+The Two Tree assumes continous uniform memoory access through Coordinate * Stride + offset, but we should lift this assumption to support paged access (2 dimensions flattened dimension).
+>>>>>>>>>Can we geometrically understand our kernel to when paging is needed/more efficient than Coordinate * stride + offset access?
+
+
+This framework will continue to grow, as more and more assumptions get challenged, the framework will be able to essentially capture a pattern, add it to its framework, allowing it to
+express a new class of kernels. (Where we treat every kernel that breaks the framework as a Pokemon to be caught, or a structual pattern to capture, allowing our framework to express even more kernels) 
+
+
+If a specific geometry keeps repeating, and the same load compute phase combinations keeps appearing, can we infer the load compute store based off the geometry alone.
+Also if the geometry is the foundation of it, and if the load compute store pattern is the same for the same geometry, can we systematically derive the needed optimziations
+for the geometry GIVEN the hardware constriants. Can this also tell us where our hardware is constrianed and cannot express our geometry, meaning can it tell us what 
+specific hardware changes need to be done to express x class of kernels?
+
+
+
+Mayhaps an exciting summer of hunting kernels that break the framework, a pokemon to be caught.
+While literature will help, I find the active part of finding "pokemons" that break the frameworks assumption as a game to played and its one that I enjoy
+
+
+
+Paging is needed if the tensor is 4D or above and needs to be flattened to 3D to match hardware, we can likely derive this need in the Geometry phase.
+
+
+
+Once the framework matures, the next step would be to see if optimizations can be predicted given our current three layer structure, and whether a new structure may need to
+be theorized. I say this is possible because just as code can only exist if it captures a repeatable pattern, an optimization must work if the conditions required to 
+apply said optimzation are present. This repeatable pattern must be demonstrated somewhere, in some way, or dimension, even if the current 3 layer structure doesnt.
+
+
+
+---------
+
+If in a Multi GPU setup, can we individualize the functions that make up our kernel, and optimize the entire GPU/partial kernel around this?
+Can this approach be useful for specific types of kernels compared to the naive? Can the Finite State Machine nature of the framework derive
+a partial encapsulation of each phase that can be optimize in such a way?
+
+
+--------
+
+The framework assumes we know the shape of our input tensor and our output tensor. 
+We know that a dimension can be stored logically (index * stride + offset) or hardware wise/flattened (/ and %).
+Does that mean given the type of data, size of data (bytes) and the length of data, can we derive the optimal way to 
+store these values in a tensor, and can we derive a combination tensor (uses both Index * stride + offset and % and /)
+
+
+------
+
+The dual purpose of the Geometric + FSM + Two Tree structure.
+
+The Geometric + FSM allows us to derive the geometric values given input output tensor, the FSM layer allows us to derive our required
+phases of Load Compute and Store, as well as allowing tracking for state variables (like in softmax). The Two Tree is an index derivation layer, this layer
+can be abstracted to cuTe/CUTLASS or Triton to professionals whom have experience, but for those whom are learning CUDA like myself, the two tree
+index derivation layer serves as a way to understand how the Geometry and FSM structure can map to actual pure CUDA code. The intention is to 
+teach the structure of kernels, rather than specific implemenations.
+
+-----
+
+Geometry is abstract enough to apply to NVIDIA CUDA, AMD ROCm and Google's TPU. The FSM is a little more specific but can be abstracted with the right language use.
+The reason is possible is because the Geometry and mostly the FSM are based on the problem, not any specific hardware/software.
+
+---------
+fundamentally the way data is stored is an inverse of the execution hierarchy what if they were parallel where 
+
+threadIdx.x always correlated to the x dimension in memory space
+we can see the register to shared to global not just as a shadow but also as a binary tree, register is the singular parent node and the leads are global
+would storing data as binary trees be more useful especially when needing to traverse thru it like what we do with the execution hierarchy?
+reminds me of the piano where all threads in the first dimension are mapped to the 3rd
+-----------
+given some code can we use the table in the reverse way to imply about to geometry?
+
+----
+
+The Geometry and FSM layer must be formed and worded to capture its hardware agnostic perspective.
+
+
+----
+
+A * B is a dimension + C implies another dimension
+
+blockIdx.y * TILE_SIZE + threadIdx.x * WORK_PER_THREAD + regRow + 1
+
+--- 
+
+At a fundamental level the Two Tree layer of our framework assumes index * stride + offset as the foundational truth. We know that this isnt true, but it instead is a pattern in a much bigger box we havent mapped.
+This means the layer needs to step back in a way to understand the whole picture rather than a specific implementation of this picture. We know this is likely the case because we have / and % which belong in the same dimension.
+But as it stands now the TTF treats / and % as a special case to the index * stride + offset pattern even though they are a pattern at the same level.
+
+
+
+
+------
+
+the geometry stage goals to capture data processing or computation but what if this geometry space doesn’t just represent  data movement but also data processing where this entire time the geometry was most just overlapped by our data tensor but a processing SOMETHING SHAPE but they are two dimensions that OVERLAP but i’ve assumed we can only see the data tensor but what if there’s an abstract data processing tensor that has been within our dimension view the entire time but we just failed to include it and it’s like gravity where we can’t see it but it effects the around it. this means for every data processing we do, the implicit geometric data processing dimension invisibly overlaps our data holding dimension and transforms it
+are the fundamentals of the geometric principles, adding, reducing and DOT product similarity based on
+
++ is a scalar 
+is a 2D operation
+/ is within a different dimension hmmm
+
+what i’m getting at is say we have x data point when we add to 3, we are adding three to it in the add minus representation space/dimension and if we say multiply it, in our latent representation space their is also a multiplication/division space which we move say somewhere else in there that changes our base data but it’s just represented different because we modified its specific latent dimension 
+
+
+data storing is all of our latent dimensions stored, data processing is us change a value in one of those dimensions
+
+higher the dimension in our all possible representation dimensions, if a small change is made in this higher dimension, if changes the lower dimensions more until it reaches the base number with the biggest change 
+
+scalar changes = small in base dimension 
+
+and / can = little changes in this dimension are big changes in scaler dimension
+
+exponential = same deal 
+
+but then there’s also exp and ln inverse relationship, is this just the + and - opposites of our scalar dimension… maybe these are two different dimensions interacting because of their unique relative position to each other 
+
+every dimension has a ruler of increase this way and decrease that way
+
+during computation what if we maintain the natural shape of our problem rather than storing them in separate shared memory tiles
+
+-----------
+
+ To derive a tensor shape by code 
+
+         scores[batch_idx * max_seq_len + token_idx] = 0.0f;
+         ->
+         [batch_size,max_seq_len]
+
+
+         smem_q[h * SMEM_STRIDE + d] = q_base[i];
+         ->
+         [h,SMEM_STRIDE]
+
+
+         page_table[batch_idx * max_pages + logical_page];
+         ->
+         [batch_size,max_pages]
+
+         !!!!
