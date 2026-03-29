@@ -826,3 +826,167 @@ during computation what if we maintain the natural shape of our problem rather t
          [batch_size,max_pages]
 
          !!!!
+
+
+--------
+
+Compare the geometric difference between a naive and a optimized kernel. If there is a geometric difference, then the optimization can be expresesd by our geometric dimension.
+If there is NOT a difference, that means we are fundamentally missing a dimension that expresses data processing.
+
+The 1D geometry dimension captures data movement but does not capture the whole picture.
+
+
+
+--------
+
+The framework cannot create code based on hardware as we have not implemented it so any architecture optimization is not necessarily possible at the moment.
+The thing is hardware are just constant across hardware iterations. For the next foreseeable year or two we can say that the DRAM will always be the DRAM, the shared memory
+will be shared memory and registers will be registers, the only thing that changes are the numbers. Although there are architecture specific optimizations such as the recent(ish)
+tensor cores, but since the framework is based on the geometry of the PROBLEM SPACE which inherently does not change, adding these should just be a technique of sort within the
+Finite State Machine layer, and or the Two Tree/Binary Tree layer.
+
+---------
+
+A framework whom does not require a special rule upon a new concept is one that is likely at the right abstraction level (although case by case basis).
+If it requires a special rule, the framework is likely, exists within a singular rule, rather than the box the rule is a part of (requires us to step back and understand why).
+
+--------
+
+how it’s stored tells us the index leaf, the type of tensor transformation tells us the equation like is it gonna add or dot which tells us every level info
+how it’s stored tells us our execution hierarchy, the tensor operation being done shows our memory hierarchy
+together this is what we’re mapping
+fundamentally
+
+is parallel programming inherently serialized, yes the computation is done faster because parallel, but we are constrained by our load compute store phases 
+if i were to make a gpu i would have the memory storage location each have extra say x bits so that we can do the computation over the memory itself where if we have a 3x3 storage each one has extra information to support holding a computation digit so we can do arithmetic right next to the storage
+the execution hierarchy is like shooting three lasers head, when it hits a compute light, it must bend and match the tensor storage layout to properly traverse it
+
+look at the hardware to see what operations are possible
+data stored in some layout, and the execution transformed by some operation to match it
+a leaf is just a way to transform our execution to the data layout
+
+the whole framework assumes no hardware constraint, hardware is a different dynamic
+Image
+any kernel is just an operation of functions in a specific order
+
+each of the three (4) axis are a column straight down
+tensor operators for loops axis 1
+tensor layout for indexing leaf axis 2
+
+Temporal (reuse) lifetime table (optimization) axis 3 
+hardware axis 4 
+are all optimizations types all specialize from their respective tensor operation axis/light? 
+
+does a combination of say temporal and tensor lights lead to different optimizations
+
+Main two axis
+
+3 tensor operation determine iterator type 
+
+addressing is from data layout 
+
+
+
+Two sub axis ? rather its respective optimizations for each respective main axis?
+
+reuse is from derivative of iterator
+hardware is derivative of address
+
+Image
+add a column for each sub input like say tensor we have the 3 operations and put each respective otpins bottleneck and optimization 
+
+
+does this for each of the three main dimensions
+maybe a cross table between axis memory layout and data addressing (each of their options) mapped out with their flaw and optimization opportunities
+
+is temporal a dot product of the data layout and data address sub-options like arithmetic dot slide
+data -> address
+operation -> tensor
+tensor operation 
+vs
+data layout 
+
+
+data layout -> address type (threads)
+
+tensor operation  -> what data we need moved (computation)
+
+. 
+TENSOR OPERATION -> LOOP TYPE (AND STATE VARS AND DIM FATE)
+
+DATA LAYOUT -> ADDRESS TYPE (LEAF) 
+
+HARDWARE SPECIFIC OPTIM
+
+
+we see our thread block grid size 
+
+then our data size and our hardware specific limit for each respective memory level
+
+then our tensor core operations (how the data will be moved)
+
+the TENSOR OPERATIONS are our DATA PROCESSING 
+the DATA LAYOUT  in each dimension of our tensors tell us DATA MOVEMENT 
+
+all we need is
+our address leaves (data layout)
+our iterator type (tensor operations)
+our lifecycle tree (temporal reuse)
+
+maybe use 7 optimization equations on each data layout DOT tensor operation to see what is the bottleneck for that specific tile of the table
+cause only the data size changes going thru it that structure will always be the same
+the 7 equations use hardware numbers ANDDD has both memory and execution operations holy fuck!!!!!
+
+TENSOR OPERATION TELLS US DATA MOVNG OR DATA PROCESSING
+
+
+ADDRESS TELLS US INDEX
+
+
+--------
+
+iterators are always thread level, but if we find the blockDim stride, can we make them block level etc? isnt that what we do with grid stride anyway
+
+
+---------
+
+For the framework, SLIDE, AREA, REDUCE can be misleading to new learners. CONTRACTION, MOVE, PROCESS is better as it follows each tensor operation does, and what 
+each iterator actually means so.
+
+
+>> DATA MOVING (DETERMINED BY TENSOR DATA LAYOUT)
+MOVE -> We move data from one memory level to another (MEMORY/MEMORY OPERATION)
+
+
+>> DATA PROCESSING (DETERMINED BY TENSOR OPERATIONS)
+CONTRACTION -> This dimension disappears/contracted (MEMORY/EXECUTION)
+AREA -> This dimension survives (MEMORY/EXECUTION)
+
+
+--------
+
+In a given dimension, can we find the numbers that produced the numbers stored? The numbers themselves may be the products of 
+prior arithmetic, so if we find the beginning of this arithmetic pipe, and the end of our arithmetic pipe (our dimension we are going to process),
+can we have  acomposite of these functions allowing us to store the composite function 
+
+------------
+
+Binding table is required because tensor operations do not map cleanly to a single loop.
+
+The tensor operation CONTRACTION requires an reduce loop (dimension being reduced) and an AREA loop, for the surviving dimension to accumulate the reduced dimension. These two loops do fundamanetally diferent jobs so they it may be hard to fuse. (Maybe you can though).. a paged loop where the row tells us the reduction part while the area (columns) tell us the AREA part of the loop? Where the columns must be M or N sized (Maybe this requires M and N to be the same dimension) and our row part of our paged loop tells us the reduction output location?
+
+
+Tiling makes it more complicated where we must SLIDE before we reduce and AREA
+
+Quite literally this is tensor cores. It attempts to fuse the REDUCTION loop and the the AREA loop into one loop, it uses a paged sort of mechanism, and the reason it may be 16 x 16 is because of the idea that I proposed earlier... memory must be ALIGNED arithmetically no fancy addresses like another / %, we need our data to be next to each other (contingious) so that our iterator whom moves 1 at a time... so our loop properly scales to the physical hardware addresses.
+
+This might be able to be side stepped if we understand the stride inbetween each memory location, but that means our data will likely not be stored within the same DRAM sector, which increases instructions required and decreases the value we get by our 32 byte DRAM sector calls if we only use say 16. One way to solve this is we can have a complex memory acess but thenn it has to land in the same DRAM sector, but that would be a sort of rombus shape where we have simple arithmetic at the top, the wide middle is the complexity we have in our address, and the bottom is the same arithmetic simple DRAM, so it makes it rather useless. This must be why an arithmetic address (where the data is stored and can be retrived coalessced/contingous) is required
+
+
+-------------------
+
+
+    // Our multi-stride formula is just Index * Stride recursively called. So this formula essentially Index * Stride just presented differently.
+    // [Current Batch] * [Num Of Heads in Batch] * [Num of Elements in Head] + [Offset within Head (Batch)] * [Size of each Head] + [Where we are within the head] 
+    // It is preferred to be presented this way as it allows us to easliy read our tensor layout of [batch_size, NUM_HEADS, HEAD_DIM]
+    // [Z Index * (Size of Y * Size of X) + (Y Index * Size of X) + X Index]
