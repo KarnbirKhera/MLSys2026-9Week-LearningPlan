@@ -786,7 +786,8 @@ __global__ void attention_mla_v1(
         //                     (CURRENT TOKEN) * (HEADS PER TOKEN) + (CURRENT HEAD WITHIN TOKEN)
         long long lse_offset = (long long)row * num_qo_heads + head_idx;
 
-        //When we input a token, we want its respective heads value
+        // (NOTE: COMMENT WAS MODIFIED AFTER FINISHED)
+        // Store the our Log Sum Exponential running sum of this row so we can compute them together with our other rows LSE values.
         out_lse[lse_offset] = logf(running_sum) + max_val;
     }
 }

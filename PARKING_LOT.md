@@ -433,7 +433,7 @@ Multi-Headed Attention
 
 
 
-   The externel PyTorch test taught me that I had assumed both our passed Q K V matrices we're all square. 
+   The external PyTorch test taught me that I had assumed both our passed Q K V matrices we're all square. 
 
     This shows a gap in my kernel process where I should first write down my assumptions, so that they can be tackled through edge case handling.
 
@@ -990,3 +990,17 @@ This might be able to be side stepped if we understand the stride inbetween each
     // [Current Batch] * [Num Of Heads in Batch] * [Num of Elements in Head] + [Offset within Head (Batch)] * [Size of each Head] + [Where we are within the head] 
     // It is preferred to be presented this way as it allows us to easliy read our tensor layout of [batch_size, NUM_HEADS, HEAD_DIM]
     // [Z Index * (Size of Y * Size of X) + (Y Index * Size of X) + X Index]
+
+
+
+  ------------
+
+
+  Can the Two Tree Framework (Geometry -> FSM -> Two Tree) provide a shared language for both kernel optimization engineers and compiler engineers. They both approach the same central problem of mappin geometry to code. The kernel optimization engineer focuses on niche cases to push every single ounce of performance, but can this "push to the edge" performance be a........ proper encapsulationn of the abstraction the code is trying to capture? Where every single optimization is just them mapping the geometric + FSM stages + index derivation and how they interact together. For compilers, I assume their job is to match the general case of kernels from geometry -> FSM -> index derviation... This is quite literally like that one paper Low Rank and Sparsity, where low rank is the general pattern (compiler engineers) and the sparsity (edge cases) are the performance optimzation engineers, but at its core, they tackle the same problem, and a unifying language and understanding between them can prove to be beneficial. It's similar to us mapping the memory and execution hierarchy through indexing where we bridge both of these trees to tackle the unified problem both are trying to solve. Where the feedback loop can be a performance engineer finds a niche optmization and is able to use the same language the compiler engineer uses (Geometry -> FSM -> Two Tree) to communicate to the compiler engineer that this edge case may provide a light onto the geometric or even something not mapped yet.
+
+  hm... each edge optmization can can allude to a missed mapping or commonly looked over understanding of our problem space. It is also true that hardware... that hardware plays a major factor where every two years we have new abilities in a way that require us to change our optimzations.... is every hardware benefit at its core a....... mapping of.. mapping of hte problem space but with a better understanidng of how we can use our current architecture to build off of to better map the problem space in its natural dimension? hmmm that might be true but we also know from softmax that geometry is not everything. We had to keep track of not just the geometry of our problem but also running max runningSum etc so there is an algorithmic perspective as well to our Geometry -> FSM -> Two Tree
+  perspective. Question is can this algorithmic space be mapped?...
+
+  ... The core reason the framework i believe is possible is because it started with if code can be created, at its fundamental level, it is mapping a higher abstracted pattern that repeats or else we couldnt code it. This means... may allude to the same is for the algorithmic side. I mean we see it every often how a simple algorithmic technique can change the way we structure our kernels. Like for RoPe that I learned from MLA attention, the key insight for RoPE was rather than having fixed values, we instead transfer said values to rotations instead. The key insight being its not the actual values that matter, its the DIFFERENCES we see between them that matters. We also see this in running softmax where it doesnt use rotationn but instead uses A * B + C to rescale its values and it subtracts it by the maximum number to avoid numerical overflow. The important insight being that in softmax, its the relative distance between numbers that matters, n ot the numbers themselves...... There must absolute be a fundamental space to understand what factors need to come into play to know when to apply these techinques. It's the same reason with code exists when a pattern is mapped, the same has to be the same for the algorithmic side where math is a fundamental constant (just like our geometrical problem space) so there must be a way to understand it.
+
+  hmmm but there is also the hardware axis that influences our kernels, but the thing is, thats implementation dependent. Its interesting because the geometric and algoritmic views are hardware agnostic, meaning they are implementation independent and are constant (unless some innovation happens in the field of geometry and algorithms/math, which you never know, it would be very lovely), so its important to understand what is our problem space (Geometry/Algorithmic/Math) vs our implementation space (FSM, Two Tree, CUDA etc). 
