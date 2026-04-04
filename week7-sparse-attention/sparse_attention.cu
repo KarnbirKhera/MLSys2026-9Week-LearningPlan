@@ -19,6 +19,9 @@
 #define PAGE_STRIDE      (PAGE_DATA_BYTES + PAGE_SCALE_BYTES)
 
 
+using bfloat16 = __nv_bfloat16;
+
+
 // Q is [batch_size, NUM_HEADS, HEAD_DIM]
 __global__ void sparse_attention_kernel(
     const __nv_bfloat16* __restrict__ Q,

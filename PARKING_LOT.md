@@ -1004,3 +1004,22 @@ This might be able to be side stepped if we understand the stride inbetween each
   ... The core reason the framework i believe is possible is because it started with if code can be created, at its fundamental level, it is mapping a higher abstracted pattern that repeats or else we couldnt code it. This means... may allude to the same is for the algorithmic side. I mean we see it every often how a simple algorithmic technique can change the way we structure our kernels. Like for RoPe that I learned from MLA attention, the key insight for RoPE was rather than having fixed values, we instead transfer said values to rotations instead. The key insight being its not the actual values that matter, its the DIFFERENCES we see between them that matters. We also see this in running softmax where it doesnt use rotationn but instead uses A * B + C to rescale its values and it subtracts it by the maximum number to avoid numerical overflow. The important insight being that in softmax, its the relative distance between numbers that matters, n ot the numbers themselves...... There must absolute be a fundamental space to understand what factors need to come into play to know when to apply these techinques. It's the same reason with code exists when a pattern is mapped, the same has to be the same for the algorithmic side where math is a fundamental constant (just like our geometrical problem space) so there must be a way to understand it.
 
   hmmm but there is also the hardware axis that influences our kernels, but the thing is, thats implementation dependent. Its interesting because the geometric and algoritmic views are hardware agnostic, meaning they are implementation independent and are constant (unless some innovation happens in the field of geometry and algorithms/math, which you never know, it would be very lovely), so its important to understand what is our problem space (Geometry/Algorithmic/Math) vs our implementation space (FSM, Two Tree, CUDA etc). 
+
+  ----------
+
+  RopE, softmax, the new google innovation all are derived that attention requires relative position and not absolute position. Given a space to express values, can we derive the transformations that do not change the dimensions expressions, but allow for optimization.
+
+
+
+  ************************************
+
+  No more additions to the parking lot and the framework until the competition is complete as the debt of theory vs application creates a drift that makes it harder to switch from theory to application.
+  At this point the framework has the following structure 
+
+  Dimension Fate -> Algorithm Classification -> Access Pattern -> Binding Table -> FSM -> LIfetime Table -> Index Trees -> Code
+
+  Surived/Reduced -> What algorithm for reduced dimension -> How is the tensor stored -> How does dimensions relate to the iterators required from the tensor operation -> Tracking of states and state variables -> Lifetiem Table to indicate re-use -> Two Tree index derivation -> Code
+
+  At the moment our framework represent sm_70. The V5 of the framework supports pipelining (sm_80) but the theory to application drift is signficiant and supercedes the pedalogical implementation of the original Two Tree framework which was its core intention in the first place. 
+
+  Additional theories can be added after 05/01/2026 (competition end)
